@@ -10,12 +10,12 @@ RUN apk add --no-cache --virtual .build-deps \
         llvm-dev \
         postgresql${PG_MAJOR}-dev && \
     cd /tmp && \
-    wget -qO- https://github.com/hanzoai/sql-vector/archive/refs/heads/main.tar.gz | tar xz && \
-    cd sql-vector-main && \
+    wget -qO- https://github.com/hanzoai/sql-vector/archive/refs/heads/master.tar.gz | tar xz && \
+    cd sql-vector-master && \
     make clean && \
     make OPTFLAGS="" && \
     make install && \
-    cd / && rm -rf /tmp/sql-vector-main && \
+    cd / && rm -rf /tmp/sql-vector-master && \
     apk del .build-deps
 
 # Stage 2: Runtime image
