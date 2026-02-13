@@ -1,0 +1,72 @@
+name: Build and Deploy Hanzo SQL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'conf/**'
+      - 'docker-entrypoint-initdb.d/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: PG_MAJOR=16
+          tags: |
+            ghcr.io/hanzoai/sql:latest
+            ghcr.io/hanzoai/sql:16-alpine
+            ghcr.io/hanzoai/sql:${{ github.sha }}
+            docker.io/hanzoai/sql:latest
+            docker.io/hanzoai/sql:16-alpine
+          cache-from: type=gha,scope=sql
+          cache-to: type=gha,mode=max,scope=sql
+
+  deploy-hanzo:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Configure kubectl (hanzo-k8s)
+        run: doctl kubernetes cluster kubeconfig save do-sfo3-hanzo-k8s
+
+      - name: Rolling update postgres
+        run: |
+          kubectl -n hanzo set image statefulset/postgres \
+            postgres=ghcr.io/hanzoai/sql:latest
+          kubectl -n hanzo rollout status statefulset/postgres --timeout=120s
