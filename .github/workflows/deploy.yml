@@ -40,7 +40,7 @@ jobs:
             echo "::error::Failed to authenticate to Hanzo KMS"; exit 1; }
 
           fetch_secret() {
-            curl -fsS "${KMS_URL}/api/v3/secrets/raw/${1}?workspaceSlug=gitops&environment=production&secretPath=/ci&viewSecretValue=true&include_imports=true" \
+            curl -fsS "${KMS_URL}/api/v3/secrets/raw/${1}?workspaceSlug=gitops&environment=prod&secretPath=/ci&viewSecretValue=true&include_imports=true" \
               -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             | jq -r '.secret.secretValue'
           }
@@ -119,7 +119,7 @@ jobs:
           )"
 
           DO_TOKEN="$(
-            curl -fsS "${KMS_URL}/api/v3/secrets/raw/DIGITALOCEAN_ACCESS_TOKEN?workspaceSlug=gitops&environment=production&secretPath=/ci&viewSecretValue=true&include_imports=true" \
+            curl -fsS "${KMS_URL}/api/v3/secrets/raw/DIGITALOCEAN_ACCESS_TOKEN?workspaceSlug=gitops&environment=prod&secretPath=/ci&viewSecretValue=true&include_imports=true" \
               -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             | jq -r '.secret.secretValue'
           )"
