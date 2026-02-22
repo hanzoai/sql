@@ -19,6 +19,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch CI secrets from Hanzo KMS
+        id: kms
+        env:
+          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
+          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          KMS_URL="${KMS_URL:-https://kms.hanzo.ai}"
+
+          ACCESS_TOKEN="$(
+            curl -fsS -X POST "${KMS_URL}/api/v1/auth/universal-auth/login" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -nc --arg cid "$KMS_CLIENT_ID" --arg cs "$KMS_CLIENT_SECRET" \
+                    '{clientId: $cid, clientSecret: $cs}')" \
+            | jq -r '.accessToken'
+          )"
+
+          [ -n "${ACCESS_TOKEN}" ] && [ "${ACCESS_TOKEN}" != "null" ] || {
+            echo "::error::Failed to authenticate to Hanzo KMS"; exit 1; }
+
+          fetch_secret() {
+            curl -fsS "${KMS_URL}/api/v3/secrets/raw/${1}?workspaceSlug=gitops&environment=production&secretPath=/ci&viewSecretValue=true&include_imports=true" \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            | jq -r '.secret.secretValue'
+          }
+
+          for name in DOCKERHUB_USERNAME DOCKERHUB_TOKEN DIGITALOCEAN_ACCESS_TOKEN; do
+            val="$(fetch_secret "$name")"
+            [ -n "$val" ] && [ "$val" != "null" ] || { echo "::error::Missing KMS secret $name"; exit 1; }
+            echo "::add-mask::${val}"
+            echo "${name}=${val}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -31,34 +67,76 @@ jobs:
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
-        continue-on-error: true
-        id: dockerhub
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ steps.kms.outputs.DOCKERHUB_USERNAME }}
+          password: ${{ steps.kms.outputs.DOCKERHUB_TOKEN }}
 
-      - name: Build and push to GHCR
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/hanzoai/sql
+            docker.io/hanzoai/sql
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=16-alpine,enable={{is_default_branch}}
+            type=sha,prefix=
+
+      - name: Build and push (all platforms)
         uses: docker/build-push-action@v5
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: PG_MAJOR=16
-          tags: |
-            ghcr.io/hanzoai/sql:latest
-            ghcr.io/hanzoai/sql:16-alpine
-            ghcr.io/hanzoai/sql:${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=sql
           cache-to: type=gha,mode=max,scope=sql
 
-      - name: Push to Docker Hub
-        if: steps.dockerhub.outcome == 'success'
-        uses: docker/build-push-action@v5
+  deploy-hanzo:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch deploy secrets from Hanzo KMS
+        id: kms
+        env:
+          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
+          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          KMS_URL="${KMS_URL:-https://kms.hanzo.ai}"
+
+          ACCESS_TOKEN="$(
+            curl -fsS -X POST "${KMS_URL}/api/v1/auth/universal-auth/login" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -nc --arg cid "$KMS_CLIENT_ID" --arg cs "$KMS_CLIENT_SECRET" \
+                    '{clientId: $cid, clientSecret: $cs}')" \
+            | jq -r '.accessToken'
+          )"
+
+          DO_TOKEN="$(
+            curl -fsS "${KMS_URL}/api/v3/secrets/raw/DIGITALOCEAN_ACCESS_TOKEN?workspaceSlug=gitops&environment=production&secretPath=/ci&viewSecretValue=true&include_imports=true" \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            | jq -r '.secret.secretValue'
+          )"
+
+          echo "::add-mask::${DO_TOKEN}"
+          echo "do_token=${DO_TOKEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
         with:
-          context: .
-          push: true
-          build-args: PG_MAJOR=16
-          tags: |
-            docker.io/hanzoai/sql:latest
-            docker.io/hanzoai/sql:16-alpine
-          cache-from: type=gha,scope=sql
+          token: ${{ steps.kms.outputs.do_token }}
+
+      - name: Configure kubectl (hanzo-k8s)
+        run: doctl kubernetes cluster kubeconfig save do-sfo3-hanzo-k8s
+
+      - name: Rolling update postgres
+        run: |
+          kubectl -n hanzo set image statefulset/postgres \
+            postgres=ghcr.io/hanzoai/sql:latest
+          kubectl -n hanzo rollout status statefulset/postgres --timeout=120s
