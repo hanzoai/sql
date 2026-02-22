@@ -17,6 +17,7 @@
 #include "access/clog.h"
 #include "access/xlogdefs.h"
 #include "lib/ilist.h"
+#include "miscadmin.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
@@ -153,10 +154,6 @@ typedef enum
  * Each backend has a PGPROC struct in shared memory.  There is also a list of
  * currently-unused PGPROC structs that will be reallocated to new backends.
  *
- * links: list link for any list the PGPROC is in.  When waiting for a lock,
- * the PGPROC is linked into that lock's waitProcs queue.  A recycled PGPROC
- * is linked into ProcGlobal's freeProcs list.
- *
  * Note: twophase.c also sets up a dummy PGPROC struct for each currently
  * prepared transaction.  These PGPROCs appear in the ProcArray data structure
  * so that the prepared transactions appear to be still running and are
@@ -166,7 +163,7 @@ typedef enum
  * but its myProcLocks[] lists are valid.
  *
  * We allow many fields of this struct to be accessed without locks, such as
- * delayChkptFlags and isRegularBackend. However, keep in mind that writing
+ * delayChkptFlags and backendType. However, keep in mind that writing
  * mirrored ones (see below) requires holding ProcArrayLock or XidGenLock in
  * at least shared mode, so that pgxactoff does not change concurrently.
  *
@@ -183,8 +180,9 @@ typedef enum
  */
 struct PGPROC
 {
-	dlist_node	links;			/* list link if process is in a list */
 	dlist_head *procgloballist; /* procglobal list that owns this PGPROC */
+	dlist_node	freeProcsLink;	/* link in procgloballist, when in recycled
+								 * state */
 
 	PGSemaphore sem;			/* ONE semaphore to sleep on */
 	ProcWaitStatus waitStatus;
@@ -233,14 +231,17 @@ struct PGPROC
 	Oid			tempNamespaceId;	/* OID of temp schema this backend is
 									 * using */
 
-	bool		isRegularBackend;	/* true if it's a regular backend. */
+	BackendType backendType;	/* what kind of process is this? */
 
 	/*
 	 * While in hot standby mode, shows that a conflict signal has been sent
 	 * for the current transaction. Set/cleared while holding ProcArrayLock,
 	 * though not required. Accessed without lock, if needed.
+	 *
+	 * This is a bitmask; each bit corresponds to a RecoveryConflictReason
+	 * enum value.
 	 */
-	bool		recoveryConflictPending;
+	pg_atomic_uint32 pendingRecoveryConflicts;
 
 	/*
 	 * Info about LWLock the process is currently waiting for, if any.
@@ -259,6 +260,7 @@ struct PGPROC
 	/* Info about lock the process is currently waiting for, if any. */
 	/* waitLock and waitProcLock are NULL if not currently waiting. */
 	LOCK	   *waitLock;		/* Lock object we're sleeping on ... */
+	dlist_node	waitLink;		/* position in waitLock->waitProcs queue */
 	PROCLOCK   *waitProcLock;	/* Per-holder info for awaited lock */
 	LOCKMODE	waitLockMode;	/* type of lock we're waiting for */
 	LOCKMASK	heldLocks;		/* bitmask for lock types already held on this
@@ -416,6 +418,16 @@ typedef struct PROC_HDR
 
 	/* Length of allProcs array */
 	uint32		allProcCount;
+
+	/*
+	 * This spinlock protects the below freelists of PGPROC structures.  We
+	 * cannot use an LWLock because the LWLock manager depends on already
+	 * having a PGPROC and a wait semaphore!  But these structures are touched
+	 * relatively infrequently (only at backend startup or shutdown) and not
+	 * for very long, so a spinlock is okay.
+	 */
+	slock_t		freeProcsLock;
+
 	/* Head of list of free PGPROC structures */
 	dlist_head	freeProcs;
 	/* Head of list of autovacuum & special worker free PGPROC structures */
@@ -424,6 +436,7 @@ typedef struct PROC_HDR
 	dlist_head	bgworkerFreeProcs;
 	/* Head of list of walsender free PGPROC structures */
 	dlist_head	walsenderFreeProcs;
+
 	/* First pgproc waiting for group XID clear */
 	pg_atomic_uint32 procArrayGroupFirst;
 	/* First pgproc waiting for group transaction status update */
@@ -485,7 +498,6 @@ extern PGDLLIMPORT int IdleSessionTimeout;
 extern PGDLLIMPORT bool log_lock_waits;
 
 #ifdef EXEC_BACKEND
-extern PGDLLIMPORT slock_t *ProcStructLock;
 extern PGDLLIMPORT PGPROC *AuxiliaryProcs;
 #endif
 
