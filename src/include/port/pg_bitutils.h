@@ -276,79 +276,73 @@ pg_ceil_log2_64(uint64 num)
 		return pg_leftmost_one_pos64(num - 1) + 1;
 }
 
-/*
- * With MSVC on x86_64 builds, try using native popcnt instructions via the
- * __popcnt and __popcnt64 intrinsics.  These don't work the same as GCC's
- * __builtin_popcount* intrinsic functions as they always emit popcnt
- * instructions.
- */
-#if defined(_MSC_VER) && defined(_M_AMD64)
-#define HAVE_X86_64_POPCNTQ
-#endif
+extern uint64 pg_popcount_portable(const char *buf, int bytes);
+extern uint64 pg_popcount_masked_portable(const char *buf, int bytes, bits8 mask);
 
+#if defined(HAVE_X86_64_POPCNTQ) || defined(USE_SVE_POPCNT_WITH_RUNTIME_CHECK)
 /*
- * On x86_64, we can use the hardware popcount instruction, but only if
- * we can verify that the CPU supports it via the cpuid instruction.
- *
- * Otherwise, we fall back to a hand-rolled implementation.
+ * Attempt to use specialized CPU instructions, but perform a runtime check
+ * first.
  */
-#ifdef HAVE_X86_64_POPCNTQ
-#if defined(HAVE__GET_CPUID) || defined(HAVE__CPUID)
-#define TRY_POPCNT_X86_64 1
-#endif
-#endif
-
-/*
- * On AArch64, we can use Neon instructions if the compiler provides access to
- * them (as indicated by __ARM_NEON).  As in simd.h, we assume that all
- * available 64-bit hardware has Neon support.
- */
-#if defined(__aarch64__) && defined(__ARM_NEON)
-#define POPCNT_AARCH64 1
-#endif
-
-#ifdef TRY_POPCNT_X86_64
-/* Attempt to use the POPCNT instruction, but perform a runtime check first */
-extern PGDLLIMPORT int (*pg_popcount32) (uint32 word);
-extern PGDLLIMPORT int (*pg_popcount64) (uint64 word);
 extern PGDLLIMPORT uint64 (*pg_popcount_optimized) (const char *buf, int bytes);
 extern PGDLLIMPORT uint64 (*pg_popcount_masked_optimized) (const char *buf, int bytes, bits8 mask);
-
-/*
- * We can also try to use the AVX-512 popcount instruction on some systems.
- * The implementation of that is located in its own file.
- */
-#ifdef USE_AVX512_POPCNT_WITH_RUNTIME_CHECK
-extern bool pg_popcount_avx512_available(void);
-extern uint64 pg_popcount_avx512(const char *buf, int bytes);
-extern uint64 pg_popcount_masked_avx512(const char *buf, int bytes, bits8 mask);
-#endif
-
-#elif POPCNT_AARCH64
-/* Use the Neon version of pg_popcount{32,64} without function pointer. */
-extern int	pg_popcount32(uint32 word);
-extern int	pg_popcount64(uint64 word);
-
-/*
- * We can try to use an SVE-optimized pg_popcount() on some systems  For that,
- * we do use a function pointer.
- */
-#ifdef USE_SVE_POPCNT_WITH_RUNTIME_CHECK
-extern PGDLLIMPORT uint64 (*pg_popcount_optimized) (const char *buf, int bytes);
-extern PGDLLIMPORT uint64 (*pg_popcount_masked_optimized) (const char *buf, int bytes, bits8 mask);
-#else
-extern uint64 pg_popcount_optimized(const char *buf, int bytes);
-extern uint64 pg_popcount_masked_optimized(const char *buf, int bytes, bits8 mask);
-#endif
 
 #else
 /* Use a portable implementation -- no need for a function pointer. */
-extern int	pg_popcount32(uint32 word);
-extern int	pg_popcount64(uint64 word);
 extern uint64 pg_popcount_optimized(const char *buf, int bytes);
 extern uint64 pg_popcount_masked_optimized(const char *buf, int bytes, bits8 mask);
 
-#endif							/* TRY_POPCNT_X86_64 */
+#endif
+
+/*
+ * pg_popcount32
+ *		Return the number of 1 bits set in word
+ */
+static inline int
+pg_popcount32(uint32 word)
+{
+#ifdef HAVE__BUILTIN_POPCOUNT
+	return __builtin_popcount(word);
+#else							/* !HAVE__BUILTIN_POPCOUNT */
+	int			result = 0;
+
+	while (word != 0)
+	{
+		result += pg_number_of_ones[word & 255];
+		word >>= 8;
+	}
+
+	return result;
+#endif							/* HAVE__BUILTIN_POPCOUNT */
+}
+
+/*
+ * pg_popcount64
+ *		Return the number of 1 bits set in word
+ */
+static inline int
+pg_popcount64(uint64 word)
+{
+#ifdef HAVE__BUILTIN_POPCOUNT
+#if SIZEOF_LONG == 8
+	return __builtin_popcountl(word);
+#elif SIZEOF_LONG_LONG == 8
+	return __builtin_popcountll(word);
+#else
+#error "cannot find integer of the same size as uint64_t"
+#endif
+#else							/* !HAVE__BUILTIN_POPCOUNT */
+	int			result = 0;
+
+	while (word != 0)
+	{
+		result += pg_number_of_ones[word & 255];
+		word >>= 8;
+	}
+
+	return result;
+#endif							/* HAVE__BUILTIN_POPCOUNT */
+}
 
 /*
  * Returns the number of 1-bits in buf.
@@ -366,13 +360,7 @@ pg_popcount(const char *buf, int bytes)
 	 * We set the threshold to the point at which we'll first use special
 	 * instructions in the optimized version.
 	 */
-#if SIZEOF_VOID_P >= 8
-	int			threshold = 8;
-#else
-	int			threshold = 4;
-#endif
-
-	if (bytes < threshold)
+	if (bytes < 8)
 	{
 		uint64		popcnt = 0;
 
@@ -397,13 +385,7 @@ pg_popcount_masked(const char *buf, int bytes, bits8 mask)
 	 * We set the threshold to the point at which we'll first use special
 	 * instructions in the optimized version.
 	 */
-#if SIZEOF_VOID_P >= 8
-	int			threshold = 8;
-#else
-	int			threshold = 4;
-#endif
-
-	if (bytes < threshold)
+	if (bytes < 8)
 	{
 		uint64		popcnt = 0;
 

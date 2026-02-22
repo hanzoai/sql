@@ -355,6 +355,8 @@ cp = find_program('cp', required: false, native: true)
 xmllint_bin = find_program(get_option('XMLLINT'), native: true, required: false)
 xsltproc_bin = find_program(get_option('XSLTPROC'), native: true, required: false)
 nm = find_program('nm', required: false, native: true)
+ditaa = find_program('ditaa', native: true, required: false)
+dot = find_program('dot', native: true, required: false)
 
 bison_flags = []
 if bison.found()
@@ -582,6 +584,33 @@ if not cc.compiles(c11_test, name: 'C11')
   endforeach
   if not c11_ok
     error('C compiler does not support C11')
+  endif
+endif
+
+
+# Do we need an option to enable C++11?
+cxx11_test = '''
+#if !defined __cplusplus || __cplusplus < 201103L
+# error "Compiler does not advertise C++11 conformance"
+#endif
+'''
+
+if have_cxx and not cxx.compiles(cxx11_test, name: 'C++11')
+  cxx11_ok = false
+  if cxx.get_id() == 'msvc'
+    cxx11_test_args = ['/std:c++14']  # oldest version supported
+  else
+    cxx11_test_args = ['-std=gnu++11', '-std=c++11']
+  endif
+  foreach arg : cxx11_test_args
+    if cxx.compiles(cxx11_test, name: 'C++11 with @0@'.format(arg), args: [arg])
+      cxx11_ok = true
+      cxxflags += arg
+      break
+    endif
+  endforeach
+  if not cxx11_ok
+    error('C++ compiler does not support C++11')
   endif
 endif
 
@@ -2125,7 +2154,7 @@ common_warning_flags = [
   '-Werror=unguarded-availability-new',
   '-Wendif-labels',
   '-Wmissing-format-attribute',
-  '-Wimplicit-fallthrough=3',
+  '-Wimplicit-fallthrough=5',
   '-Wcast-function-type',
   '-Wshadow=compatible-local',
   # This was included in -Wall/-Wformat in older GCC versions
@@ -2614,7 +2643,9 @@ endif
 
 if host_cpu == 'x86_64'
 
-  if cc.compiles('''
+  if cc.get_id() == 'msvc'
+    cdata.set('HAVE_X86_64_POPCNTQ', 1)
+  elif cc.compiles('''
       void main(void)
       {
           long long x = 1; long long r;
@@ -2882,7 +2913,7 @@ gnugetopt_dep = cc.find_library('gnugetopt', required: false)
 #   (i.e., allow '-' as a flag character), so use our version on those platforms
 # - We want to use system's getopt_long() only if the system provides struct
 #   option
-always_replace_getopt = host_system in ['windows', 'cygwin', 'openbsd', 'solaris']
+always_replace_getopt = host_system in ['windows', 'cygwin', 'openbsd', 'sunos']
 always_replace_getopt_long = host_system in ['windows', 'cygwin'] or not cdata.has('HAVE_STRUCT_OPTION')
 
 # Required on BSDs
