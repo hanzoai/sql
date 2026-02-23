@@ -74,27 +74,49 @@ jobs:
           username: ${{ steps.kms.outputs.DOCKERHUB_USERNAME }}
           password: ${{ steps.kms.outputs.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
+      - name: GHCR metadata
+        id: meta-ghcr
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ghcr.io/hanzoai/sql
-            docker.io/hanzoai/sql
+          images: ghcr.io/hanzoai/sql
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=16-alpine,enable={{is_default_branch}}
             type=sha,prefix=
 
-      - name: Build and push (all platforms)
+      - name: Docker Hub metadata
+        id: meta-dockerhub
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/hanzoai/sql
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=16-alpine,enable={{is_default_branch}}
+            type=sha,prefix=
+
+      - name: Build and push to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: PG_MAJOR=16
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta-ghcr.outputs.tags }}
+          labels: ${{ steps.meta-ghcr.outputs.labels }}
+          cache-from: type=gha,scope=sql
+          cache-to: type=gha,mode=max,scope=sql
+
+      - name: Push to Docker Hub
+        if: steps.dockerhub.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: PG_MAJOR=16
+          tags: ${{ steps.meta-dockerhub.outputs.tags }}
+          labels: ${{ steps.meta-dockerhub.outputs.labels }}
           cache-from: type=gha,scope=sql
           cache-to: type=gha,mode=max,scope=sql
 
