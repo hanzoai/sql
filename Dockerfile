@@ -1,4 +1,4 @@
-ARG PG_MAJOR=16
+ARG PG_MAJOR=18
 
 # Stage 1: Build pgvector extension from Hanzo fork
 FROM postgres:${PG_MAJOR}-alpine AS builder
