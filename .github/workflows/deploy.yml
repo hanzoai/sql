@@ -157,7 +157,7 @@ jobs:
           token: ${{ steps.kms.outputs.do_token }}
 
       - name: Configure kubectl (hanzo-k8s)
-        run: doctl kubernetes cluster kubeconfig save do-sfo3-hanzo-k8s
+        run: doctl kubernetes cluster kubeconfig save hanzo-k8s
 
       - name: Rolling update postgres
         run: |
