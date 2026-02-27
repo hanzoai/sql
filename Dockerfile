@@ -1,4 +1,6 @@
-ARG PG_VERSION=pg17
+# PINNED to PG16 — production data on PVC is PG16 format.
+# DO NOT bump to pg17+ without running pg_upgrade first.
+ARG PG_VERSION=pg16
 
 # Hanzo SQL: PostgreSQL + pgvector with Hanzo defaults
 FROM pgvector/pgvector:${PG_VERSION}

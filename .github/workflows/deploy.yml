@@ -89,7 +89,7 @@ jobs:
             hanzoai/sql
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=18,enable={{is_default_branch}}
+            type=raw,value=16,enable={{is_default_branch}}
             type=sha,prefix=
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -161,8 +161,8 @@ jobs:
       - name: Configure kubectl (hanzo-k8s)
         run: doctl kubernetes cluster kubeconfig save hanzo-k8s
 
-      - name: Rolling update postgres
+      - name: Rolling update sql
         run: |
-          kubectl -n hanzo set image statefulset/postgres \
-            postgres=ghcr.io/hanzoai/sql:latest
-          kubectl -n hanzo rollout status statefulset/postgres --timeout=120s
+          kubectl -n hanzo set image statefulset/sql \
+            sql=ghcr.io/hanzoai/sql:${GITHUB_SHA::7}
+          kubectl -n hanzo rollout status statefulset/sql --timeout=120s
