@@ -9,7 +9,7 @@
 - **Multi-tenant Support** - Organization-scoped schemas
 - **High Availability** - Streaming replication ready
 
-Repository: https://github.com/hanzoai/postgres
+Repository: https://github.com/hanzoai/sql
 
 ## Quick Start
 
