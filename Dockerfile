@@ -6,7 +6,7 @@ ARG PG_VERSION=pg16
 FROM pgvector/pgvector:${PG_VERSION}
 
 LABEL maintainer="dev@hanzo.ai"
-LABEL org.opencontainers.image.source="https://github.com/hanzoai/postgres"
+LABEL org.opencontainers.image.source="https://github.com/hanzoai/sql"
 LABEL org.opencontainers.image.description="Hanzo SQL - PostgreSQL with pgvector and Hanzo defaults"
 
 # Copy initialization scripts
