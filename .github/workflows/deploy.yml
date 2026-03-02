@@ -140,8 +140,14 @@ jobs:
       - name: Configure kubectl (hanzo-k8s)
         run: doctl kubernetes cluster kubeconfig save hanzo-k8s
 
-      - name: Rolling update postgres
+      - name: Rolling update hanzo-sql
         run: |
-          kubectl -n hanzo set image statefulset/postgres \
-            postgres=ghcr.io/hanzoai/sql:latest
-          kubectl -n hanzo rollout status statefulset/postgres --timeout=120s
+          # Update both clusters if StatefulSets exist
+          for ss in hanzo-sql sql; do
+            if kubectl -n hanzo get statefulset/${ss} &>/dev/null; then
+              kubectl -n hanzo set image statefulset/${ss} \
+                sql=ghcr.io/hanzoai/sql:latest
+              kubectl -n hanzo rollout status statefulset/${ss} --timeout=120s
+              break
+            fi
+          done
