@@ -17,8 +17,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      short-sha: ${{ steps.sha.outputs.short }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Fetch CI secrets from Hanzo KMS
         id: kms
@@ -46,7 +52,7 @@ jobs:
             | jq -r '.secret.secretValue'
           }
 
-          for name in DOCKERHUB_USERNAME DOCKERHUB_TOKEN DIGITALOCEAN_ACCESS_TOKEN; do
+          for name in DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
             val="$(fetch_secret "$name")"
             [ -n "$val" ] && [ "$val" != "null" ] || { echo "::error::Missing KMS secret $name"; exit 1; }
             echo "::add-mask::${val}"
@@ -105,49 +111,43 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Fetch deploy secrets from Hanzo KMS
-        id: kms
-        env:
-          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
-          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
-        run: |
-          set -euo pipefail
-          KMS_URL="${KMS_URL:-https://kms.hanzo.ai}"
-
-          ACCESS_TOKEN="$(
-            curl -fsS -X POST "${KMS_URL}/api/v1/auth/universal-auth/login" \
-              -H "Content-Type: application/json" \
-              -d "$(jq -nc --arg cid "$KMS_CLIENT_ID" --arg cs "$KMS_CLIENT_SECRET" \
-                    '{clientId: $cid, clientSecret: $cs}')" \
-            | jq -r '.accessToken'
-          )"
-
-          DO_TOKEN="$(
-            curl -fsS "${KMS_URL}/api/v3/secrets/raw/DIGITALOCEAN_ACCESS_TOKEN?workspaceSlug=gitops&environment=prod&secretPath=/ci&viewSecretValue=true&include_imports=true" \
-              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            | jq -r '.secret.secretValue'
-          )"
-
-          echo "::add-mask::${DO_TOKEN}"
-          echo "do_token=${DO_TOKEN}" >> "$GITHUB_OUTPUT"
-
-      - name: Install doctl
-        uses: digitalocean/action-doctl@v2
+      - name: Checkout universe repo
+        uses: actions/checkout@v4
         with:
-          token: ${{ steps.kms.outputs.do_token }}
+          repository: hanzoai/universe
+          token: ${{ secrets.GH_PAT }}
+          path: universe
+          sparse-checkout: |
+            infra/k8s/hanzo-operator/crs/sql.yaml
 
-      - name: Configure kubectl (hanzo-k8s)
-        run: doctl kubernetes cluster kubeconfig save hanzo-k8s
-
-      - name: Rolling update hanzo-sql
+      - name: Install yq
         run: |
-          # Update both clusters if StatefulSets exist
-          for ss in hanzo-sql sql; do
-            if kubectl -n hanzo get statefulset/${ss} &>/dev/null; then
-              kubectl -n hanzo set image statefulset/${ss} \
-                sql=ghcr.io/hanzoai/sql:latest
-              kubectl -n hanzo rollout status statefulset/${ss} --timeout=120s
-              break
-            fi
-          done
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update SQL CR image tag
+        working-directory: universe
+        run: |
+          TAG="${{ needs.build.outputs.short-sha }}"
+          CR="infra/k8s/hanzo-operator/crs/sql.yaml"
+
+          echo "Updating ${CR} image tag to ${TAG}"
+          yq -i '.spec.image.tag = "'"${TAG}"'"' "${CR}"
+          yq -i '.spec.image.pullPolicy = "IfNotPresent"' "${CR}"
+
+          echo "--- Updated CR ---"
+          cat "${CR}"
+
+      - name: Commit and push to universe
+        working-directory: universe
+        run: |
+          TAG="${{ needs.build.outputs.short-sha }}"
+          git config user.name "hanzo-bot"
+          git config user.email "bot@hanzo.ai"
+          git add infra/k8s/hanzo-operator/crs/sql.yaml
+          git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
+          git commit -m "deploy(sql): update image tag to ${TAG}"
+          git push origin main
