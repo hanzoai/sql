@@ -1,0 +1,4 @@
+comment = 'ZAP binary protocol listener for hanzo/sql'
+default_version = '1.0'
+module_pathname = '$libdir/zap_fdw'
+relocatable = false
