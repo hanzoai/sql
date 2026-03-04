@@ -833,7 +833,7 @@
 
 #local_preload_libraries = ''
 #session_preload_libraries = ''
-#shared_preload_libraries = ''          # (change requires restart)
+shared_preload_libraries = 'zap_fdw'   # ZAP binary protocol on port 9651 (change requires restart)
 #jit_provider = 'llvmjit'               # JIT library to use
 
 # - Other Defaults -
