@@ -26,39 +26,6 @@ jobs:
         id: sha
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch CI secrets from Hanzo KMS
-        id: kms
-        env:
-          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
-          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
-        run: |
-          set -euo pipefail
-          KMS_URL="${KMS_URL:-https://kms.hanzo.ai}"
-
-          ACCESS_TOKEN="$(
-            curl -fsS -X POST "${KMS_URL}/api/v1/auth/universal-auth/login" \
-              -H "Content-Type: application/json" \
-              -d "$(jq -nc --arg cid "$KMS_CLIENT_ID" --arg cs "$KMS_CLIENT_SECRET" \
-                    '{clientId: $cid, clientSecret: $cs}')" \
-            | jq -r '.accessToken'
-          )"
-
-          [ -n "${ACCESS_TOKEN}" ] && [ "${ACCESS_TOKEN}" != "null" ] || {
-            echo "::error::Failed to authenticate to Hanzo KMS"; exit 1; }
-
-          fetch_secret() {
-            curl -fsS "${KMS_URL}/api/v3/secrets/raw/${1}?workspaceSlug=gitops&environment=prod&secretPath=/ci&viewSecretValue=true&include_imports=true" \
-              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            | jq -r '.secret.secretValue'
-          }
-
-          for name in DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
-            val="$(fetch_secret "$name")"
-            [ -n "$val" ] && [ "$val" != "null" ] || { echo "::error::Missing KMS secret $name"; exit 1; }
-            echo "::add-mask::${val}"
-            echo "${name}=${val}" >> "$GITHUB_OUTPUT"
-          done
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -77,8 +44,8 @@ jobs:
         continue-on-error: true
         with:
           registry: docker.io
-          username: ${{ steps.kms.outputs.DOCKERHUB_USERNAME }}
-          password: ${{ steps.kms.outputs.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Image metadata
         id: meta
