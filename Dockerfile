@@ -77,13 +77,14 @@ RUN cd /tmp && \
     make -j$(nproc) AM_CFLAGS=-fPIC install && \
     cd / && rm -rf /tmp/pcre2-*
 
-# --- pg_documentdb (core + api) ---
+# --- pg_documentdb (core + api + extended_rum) ---
 ARG DOCUMENTDB_VERSION=main
 RUN cd /tmp && \
     curl -sL https://github.com/microsoft/documentdb/archive/refs/heads/${DOCUMENTDB_VERSION}.tar.gz | tar xz && \
     cd documentdb-* && \
     make -C pg_documentdb_core PG_CONFIG=/usr/bin/pg_config install && \
     make -C pg_documentdb PG_CONFIG=/usr/bin/pg_config install && \
+    make -C pg_documentdb_extended_rum PG_CONFIG=/usr/bin/pg_config install && \
     cd / && rm -rf /tmp/documentdb-*
 
 # Stage 2: Runtime image (Debian for glibc compat with documentdb)
@@ -118,6 +119,11 @@ COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/documentdb_core*
 # Copy pg_documentdb extension
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb.so /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/documentdb* /usr/share/postgresql/${PG_MAJOR}/extension/
+
+# Copy pg_documentdb_extended_rum extension
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_extended_rum_core.so /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_extended_rum.so /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/documentdb_extended_rum* /usr/share/postgresql/${PG_MAJOR}/extension/
 
 # Custom postgresql.conf tuned for AI workloads
 COPY conf/postgresql.conf /etc/postgresql/postgresql.conf
