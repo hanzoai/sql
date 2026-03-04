@@ -1,2 +1,7 @@
--- Hanzo SQL: Enable pgvector extension
+-- Hanzo SQL: Enable extensions
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS tsm_system_rows;
+CREATE EXTENSION IF NOT EXISTS documentdb_core;
+CREATE EXTENSION IF NOT EXISTS documentdb;
