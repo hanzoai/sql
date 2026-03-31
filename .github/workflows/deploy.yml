@@ -7,6 +7,7 @@ on:
     paths:
       - 'Dockerfile'
       - 'conf/**'
+      - 'contrib/zap_fdw/**'
       - 'docker-entrypoint-initdb.d/**'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:

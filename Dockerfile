@@ -77,6 +77,13 @@ RUN cd /tmp && \
     make -j$(nproc) AM_CFLAGS=-fPIC install && \
     cd / && rm -rf /tmp/pcre2-*
 
+# --- zap_fdw (ZAP binary protocol — disabled by default via zap.enabled GUC) ---
+COPY contrib/zap_fdw /tmp/zap_fdw
+RUN cd /tmp/zap_fdw && \
+    make USE_PGXS=1 PG_CONFIG=/usr/bin/pg_config && \
+    make USE_PGXS=1 PG_CONFIG=/usr/bin/pg_config install && \
+    cd / && rm -rf /tmp/zap_fdw
+
 # --- pg_documentdb (core + api + extended_rum) ---
 ARG DOCUMENTDB_VERSION=main
 RUN cd /tmp && \
@@ -124,6 +131,10 @@ COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/documentdb* /usr
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_extended_rum_core.so /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/pg_documentdb_extended_rum.so /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/documentdb_extended_rum* /usr/share/postgresql/${PG_MAJOR}/extension/
+
+# Copy zap_fdw extension (disabled by default — set zap.enabled=true to activate)
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/zap_fdw.so /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/zap_fdw* /usr/share/postgresql/${PG_MAJOR}/extension/
 
 # Custom postgresql.conf tuned for AI workloads
 COPY conf/postgresql.conf /etc/postgresql/postgresql.conf
