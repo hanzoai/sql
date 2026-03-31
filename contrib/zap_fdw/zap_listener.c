@@ -17,22 +17,30 @@
 #include "utils/guc.h"
 #include "tcop/utility.h"
 
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "zap_protocol.h"
 
 PG_MODULE_MAGIC;
 
 /* GUC variables */
+static bool zap_enabled = false;
 static int zap_port = 9651;
+static char *zap_database = NULL;
+
+/* Signal handler flag — must be before zap_worker_main which references it */
+static volatile sig_atomic_t got_sigterm = false;
 
 /* Forward declarations */
 void _PG_init(void);
 PGDLLEXPORT void zap_worker_main(Datum main_arg);
+static void zap_sigterm_handler(SIGNAL_ARGS);
 
 /* External SPI functions */
 extern char *zap_execute_query(const char *sql, int sql_len);
@@ -249,6 +257,28 @@ handle_zap_message(int client_fd, const uint8_t *data, size_t data_len)
 }
 
 /*
+ * Resolve which database the ZAP worker connects to.
+ * Priority: zap.database GUC > POSTGRES_DB env var > "postgres" (always exists).
+ */
+static const char *
+zap_resolve_database(void)
+{
+    const char *db;
+
+    /* Explicit GUC wins */
+    if (zap_database && zap_database[0] != '\0')
+        return zap_database;
+
+    /* Fall back to POSTGRES_DB env var (set by official PG Docker entrypoint) */
+    db = getenv("POSTGRES_DB");
+    if (db && db[0] != '\0')
+        return db;
+
+    /* Safe default — "postgres" always exists */
+    return "postgres";
+}
+
+/*
  * Background worker main loop — listens for ZAP connections.
  */
 void
@@ -256,10 +286,15 @@ zap_worker_main(Datum main_arg)
 {
     int server_fd;
     struct sockaddr_in addr;
+    const char *dbname;
 
     /* Register signal handlers */
+    pqsignal(SIGTERM, zap_sigterm_handler);
     BackgroundWorkerUnblockSignals();
-    BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+
+    dbname = zap_resolve_database();
+    elog(LOG, "zap: connecting to database \"%s\"", dbname);
+    BackgroundWorkerInitializeConnection(dbname, NULL, 0);
 
     /* Ensure KV table exists */
     zap_kv_ensure_table();
@@ -326,9 +361,6 @@ zap_worker_main(Datum main_arg)
     elog(LOG, "zap: listener shutting down");
 }
 
-/* Signal handler flag */
-static volatile sig_atomic_t got_sigterm = false;
-
 static void
 zap_sigterm_handler(SIGNAL_ARGS)
 {
@@ -339,14 +371,26 @@ zap_sigterm_handler(SIGNAL_ARGS)
 }
 
 /*
- * Module initialization — register background worker and GUCs.
+ * Module initialization — register GUCs and optionally register background worker.
+ *
+ * The ZAP listener is OFF by default (zap.enabled = false).
+ * Set zap.enabled = true in postgresql.conf to activate the ZAP binary protocol.
+ * This allows hanzo/sql to ship as vanilla PostgreSQL when ZAP is not needed.
  */
 void
 _PG_init(void)
 {
-    BackgroundWorker worker;
+    /* Define GUC: zap.enabled (default false — vanilla PG behavior) */
+    DefineCustomBoolVariable("zap.enabled",
+                            "Enable ZAP binary protocol listener",
+                            "When false, hanzo/sql behaves as vanilla PostgreSQL.",
+                            &zap_enabled,
+                            false,  /* default: disabled */
+                            PGC_POSTMASTER,
+                            0,
+                            NULL, NULL, NULL);
 
-    /* Define GUC for port */
+    /* Define GUC: zap.port */
     DefineCustomIntVariable("zap.port",
                            "Port for ZAP binary protocol listener",
                            NULL,
@@ -358,17 +402,38 @@ _PG_init(void)
                            0,
                            NULL, NULL, NULL);
 
-    /* Register background worker */
-    memset(&worker, 0, sizeof(worker));
-    snprintf(worker.bgw_name, BGW_MAXLEN, "zap listener");
-    snprintf(worker.bgw_type, BGW_MAXLEN, "zap listener");
-    worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-    worker.bgw_restart_time = 5;  /* restart after 5 seconds on crash */
-    snprintf(worker.bgw_library_name, BGW_MAXLEN, "zap_fdw");
-    snprintf(worker.bgw_function_name, BGW_MAXLEN, "zap_worker_main");
-    worker.bgw_main_arg = (Datum)0;
-    worker.bgw_notify_pid = 0;
+    /* Define GUC: zap.database */
+    DefineCustomStringVariable("zap.database",
+                              "Database for ZAP background worker to connect to",
+                              "Defaults to POSTGRES_DB env var, then \"postgres\".",
+                              &zap_database,
+                              "",    /* empty = use env var fallback */
+                              PGC_POSTMASTER,
+                              0,
+                              NULL, NULL, NULL);
 
-    RegisterBackgroundWorker(&worker);
+    /* Only register the background worker when ZAP is explicitly enabled */
+    if (zap_enabled)
+    {
+        BackgroundWorker worker;
+
+        memset(&worker, 0, sizeof(worker));
+        snprintf(worker.bgw_name, BGW_MAXLEN, "zap listener");
+        snprintf(worker.bgw_type, BGW_MAXLEN, "zap listener");
+        worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+        worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+        worker.bgw_restart_time = 5;  /* restart after 5 seconds on crash */
+        snprintf(worker.bgw_library_name, BGW_MAXLEN, "zap_fdw");
+        snprintf(worker.bgw_function_name, BGW_MAXLEN, "zap_worker_main");
+        worker.bgw_main_arg = (Datum)0;
+        worker.bgw_notify_pid = 0;
+
+        RegisterBackgroundWorker(&worker);
+
+        elog(LOG, "zap: registered background worker on port %d", zap_port);
+    }
+    else
+    {
+        elog(LOG, "zap: disabled (set zap.enabled=true to activate)");
+    }
 }

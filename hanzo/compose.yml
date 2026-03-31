@@ -1,19 +1,19 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg17
+    image: ghcr.io/hanzoai/sql:18
     container_name: hanzo-postgres
     ports:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./init.sql:/docker-entrypoint-initdb.d/99-hanzo-init.sql:ro
     environment:
-      POSTGRES_DB: hanzo
-      POSTGRES_USER: hanzo
+      POSTGRES_DB: ${POSTGRES_DB:-hanzo}
+      POSTGRES_USER: ${POSTGRES_USER:-hanzo}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hanzo_dev}
       PGDATA: /var/lib/postgresql/data/pgdata
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hanzo -d hanzo"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hanzo} -d ${POSTGRES_DB:-hanzo}"]
       interval: 10s
       timeout: 5s
       retries: 5

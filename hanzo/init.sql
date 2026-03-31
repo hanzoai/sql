@@ -12,8 +12,10 @@ CREATE SCHEMA IF NOT EXISTS hanzo;
 CREATE SCHEMA IF NOT EXISTS console;
 CREATE SCHEMA IF NOT EXISTS iam;
 
--- Set search path
-ALTER DATABASE hanzo SET search_path TO hanzo, public;
+-- Set search path (uses current database, works with any POSTGRES_DB value)
+DO $$ BEGIN
+    EXECUTE format('ALTER DATABASE %I SET search_path TO hanzo, public', current_database());
+END $$;
 
 -- Create service roles
 DO $$
