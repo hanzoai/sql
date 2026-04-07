@@ -1,4 +1,4 @@
-# sql — AI Assistant Context
+# postgres — AI Assistant Context
 
 PostgreSQL Database Management System
 =====================================
