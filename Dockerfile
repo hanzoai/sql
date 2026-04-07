@@ -149,3 +149,4 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
 EXPOSE 5432
 
 CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+
