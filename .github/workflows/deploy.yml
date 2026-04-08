@@ -2,7 +2,7 @@ name: Build and Deploy Hanzo SQL
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, dev, test]
     tags: ['v*']
     paths:
       - 'Dockerfile'
