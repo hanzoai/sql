@@ -1,6 +1,6 @@
-name: Build and Deploy Hanzo SQL
-
+name: Docker
 on:
+  workflow_dispatch:
   push:
     branches: [main, dev, test]
     tags: ['v*']
@@ -10,112 +10,14 @@ on:
       - 'contrib/zap_fdw/**'
       - 'docker-entrypoint-initdb.d/**'
       - '.github/workflows/deploy.yml'
-  workflow_dispatch:
-
+permissions:
+  contents: read
+  packages: write
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      short-sha: ${{ steps.sha.outputs.short }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Compute short SHA
-        id: sha
-        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        continue-on-error: true
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ghcr.io/hanzoai/sql
-            hanzoai/sql
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=18,enable={{is_default_branch}}
-            type=sha,prefix=
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: PG_MAJOR=18
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=sql
-          cache-to: type=gha,mode=max,scope=sql
-
-  deploy-hanzo:
-    needs: build
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout universe repo
-        uses: actions/checkout@v4
-        with:
-          repository: hanzoai/universe
-          token: ${{ secrets.GH_PAT }}
-          path: universe
-          sparse-checkout: |
-            infra/k8s/hanzo-operator/crs/sql.yaml
-
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
-
-      - name: Update SQL CR image tag
-        working-directory: universe
-        run: |
-          TAG="${{ needs.build.outputs.short-sha }}"
-          CR="infra/k8s/hanzo-operator/crs/sql.yaml"
-
-          echo "Updating ${CR} image tag to ${TAG}"
-          yq -i '.spec.image.tag = "'"${TAG}"'"' "${CR}"
-          yq -i '.spec.image.pullPolicy = "IfNotPresent"' "${CR}"
-
-          echo "--- Updated CR ---"
-          cat "${CR}"
-
-      - name: Commit and push to universe
-        working-directory: universe
-        run: |
-          TAG="${{ needs.build.outputs.short-sha }}"
-          git config user.name "hanzo-bot"
-          git config user.email "bot@hanzo.ai"
-          git add infra/k8s/hanzo-operator/crs/sql.yaml
-          git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
-          git commit -m "deploy(sql): update image tag to ${TAG}"
-          git push origin main
+  docker:
+    uses: hanzoai/.github/.github/workflows/docker-build.yml@main
+    with:
+      image: ghcr.io/hanzoai/sql
+      build-args: |
+        PG_MAJOR=18
+    secrets: inherit
