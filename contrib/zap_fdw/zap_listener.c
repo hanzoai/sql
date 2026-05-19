@@ -299,11 +299,15 @@ zap_worker_main(Datum main_arg)
     /* Ensure KV table exists */
     zap_kv_ensure_table();
 
-    /* Create TCP socket */
+    /* Create TCP socket. PG 18 elog() macro plants a local `__errno_location`
+     * via pg_prevent_errno_in_scope, shadowing glibc's function and breaking
+     * any direct errno reference inside the macro expansion. Capture errno
+     * into a stack local *before* elog/ereport. */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
     {
-        elog(ERROR, "zap: socket() failed: %s", strerror(errno));
+        int saved_errno = errno;
+        elog(ERROR, "zap: socket() failed: %s", strerror(saved_errno));
         return;
     }
 
@@ -319,14 +323,16 @@ zap_worker_main(Datum main_arg)
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        elog(ERROR, "zap: bind() port %d failed: %s", zap_port, strerror(errno));
+        int saved_errno = errno;
+        elog(ERROR, "zap: bind() port %d failed: %s", zap_port, strerror(saved_errno));
         close(server_fd);
         return;
     }
 
     if (listen(server_fd, 32) < 0)
     {
-        elog(ERROR, "zap: listen() failed: %s", strerror(errno));
+        int saved_errno = errno;
+        elog(ERROR, "zap: listen() failed: %s", strerror(saved_errno));
         close(server_fd);
         return;
     }
@@ -343,9 +349,10 @@ zap_worker_main(Datum main_arg)
         client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0)
         {
-            if (errno == EINTR)
+            int saved_errno = errno;
+            if (saved_errno == EINTR)
                 continue;
-            elog(WARNING, "zap: accept() failed: %s", strerror(errno));
+            elog(WARNING, "zap: accept() failed: %s", strerror(saved_errno));
             continue;
         }
 
