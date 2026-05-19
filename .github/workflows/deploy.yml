@@ -4,20 +4,18 @@ on:
   push:
     branches: [main, dev, test]
     tags: ['v*']
-    paths:
-      - 'Dockerfile'
-      - 'conf/**'
-      - 'contrib/zap_fdw/**'
-      - 'docker-entrypoint-initdb.d/**'
-      - '.github/workflows/deploy.yml'
+
 permissions:
   contents: read
   packages: write
+  id-token: write
+
 jobs:
   docker:
     uses: hanzoai/.github/.github/workflows/docker-build.yml@main
     with:
       image: ghcr.io/hanzoai/sql
+      platforms: linux/amd64
       build-args: |
         PG_MAJOR=18
     secrets: inherit
