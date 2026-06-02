@@ -34,6 +34,8 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_propgraph_label.h"
+#include "catalog/pg_propgraph_property.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_statistic.h"
@@ -847,6 +849,85 @@ comparison_ops_are_compatible(Oid opno1, Oid opno2)
 		 */
 		if (op_in_opfamily(opno2, op_form->amopfamily) &&
 			GetIndexAmRoutineByAmId(op_form->amopmethod, false)->amconsistentordering)
+		{
+			result = true;
+			break;
+		}
+	}
+
+	ReleaseSysCacheList(catlist);
+
+	return result;
+}
+
+/*
+ * collations_agree_on_equality
+ *		Return true if the two collations have equivalent notions of equality,
+ *		so that a uniqueness or equality proof established under one side
+ *		carries over to a comparison performed under the other side.
+ *
+ * Note: this is equality compatibility only.  Do NOT use this to reason
+ * about ordering.
+ *
+ * An InvalidOid on either side denotes the absence of a collation -- that
+ * side's operation is not collation-sensitive (e.g. a non-collatable column
+ * type).  Absence of a collation cannot conflict with the other side's
+ * collation, so we treat such pairs as agreeing on equality.  This generalizes
+ * the asymmetric treatment in IndexCollMatchesExprColl().
+ *
+ * Otherwise the collations have equivalent equality if they match, or if both
+ * are deterministic: by definition a deterministic collation treats two
+ * strings as equal iff they are byte-wise equal (see CREATE COLLATION), so any
+ * two deterministic collations share the same equality relation.  A mismatch
+ * involving a nondeterministic collation, however, may mean the two equality
+ * relations disagree, and the proof is unsound.
+ */
+bool
+collations_agree_on_equality(Oid coll1, Oid coll2)
+{
+	if (!OidIsValid(coll1) || !OidIsValid(coll2))
+		return true;
+
+	if (coll1 == coll2)
+		return true;
+
+	if (!get_collation_isdeterministic(coll1) ||
+		!get_collation_isdeterministic(coll2))
+		return false;
+
+	return true;
+}
+
+/*
+ * op_is_safe_index_member
+ *		Check if the operator is a member of a B-tree or Hash operator family.
+ *
+ * We use this check as a proxy for "null-safety": if an operator is trusted by
+ * the btree or hash opfamily, it implies that the operator adheres to standard
+ * boolean behavior, and would not return NULL when given valid non-null
+ * inputs, as doing so would break index integrity.
+ */
+bool
+op_is_safe_index_member(Oid opno)
+{
+	bool		result = false;
+	CatCList   *catlist;
+	int			i;
+
+	/*
+	 * Search pg_amop to see if the target operator is registered for any
+	 * btree or hash opfamily.
+	 */
+	catlist = SearchSysCacheList1(AMOPOPID, ObjectIdGetDatum(opno));
+
+	for (i = 0; i < catlist->n_members; i++)
+	{
+		HeapTuple	tuple = &catlist->members[i]->tuple;
+		Form_pg_amop aform = (Form_pg_amop) GETSTRUCT(tuple);
+
+		/* Check if the AM is B-tree or Hash */
+		if (aform->amopmethod == BTREE_AM_OID ||
+			aform->amopmethod == HASH_AM_OID)
 		{
 			result = true;
 			break;
@@ -3547,6 +3628,26 @@ get_namespace_name_or_temp(Oid nspid)
 		return get_namespace_name(nspid);
 }
 
+/*
+ * get_qualified_objname
+ *		Returns a palloc'd string containing the schema-qualified name of the
+ *		object for the given namespace ID and object name.
+ */
+char *
+get_qualified_objname(Oid nspid, char *objname)
+{
+	char	   *nspname;
+	char	   *result;
+
+	nspname = get_namespace_name_or_temp(nspid);
+	if (!nspname)
+		elog(ERROR, "cache lookup failed for namespace %u", nspid);
+
+	result = quote_qualified_identifier(nspname, objname);
+
+	return result;
+}
+
 /*				---------- PG_RANGE CACHES ----------				 */
 
 /*
@@ -3598,6 +3699,31 @@ get_range_collation(Oid rangeOid)
 	}
 	else
 		return InvalidOid;
+}
+
+/*
+ * get_range_constructor2
+ *		Gets the 2-arg constructor for the given rangetype.
+ *
+ *	Raises an error if not found.
+ */
+RegProcedure
+get_range_constructor2(Oid rangeOid)
+{
+	HeapTuple	tp;
+
+	tp = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(rangeOid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_range rngtup = (Form_pg_range) GETSTRUCT(tp);
+		RegProcedure result;
+
+		result = rngtup->rngconstruct2;
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		elog(ERROR, "cache lookup failed for range type %u", rangeOid);
 }
 
 /*
@@ -3865,4 +3991,40 @@ get_subscription_name(Oid subid, bool missing_ok)
 	ReleaseSysCache(tup);
 
 	return subname;
+}
+
+char *
+get_propgraph_label_name(Oid labeloid)
+{
+	HeapTuple	tuple;
+	char	   *labelname;
+
+	tuple = SearchSysCache1(PROPGRAPHLABELOID, ObjectIdGetDatum(labeloid));
+	if (!tuple)
+	{
+		elog(ERROR, "cache lookup failed for label %u", labeloid);
+		return NULL;
+	}
+	labelname = pstrdup(NameStr(((Form_pg_propgraph_label) GETSTRUCT(tuple))->pgllabel));
+	ReleaseSysCache(tuple);
+
+	return labelname;
+}
+
+char *
+get_propgraph_property_name(Oid propoid)
+{
+	HeapTuple	tuple;
+	char	   *propname;
+
+	tuple = SearchSysCache1(PROPGRAPHPROPOID, ObjectIdGetDatum(propoid));
+	if (!tuple)
+	{
+		elog(ERROR, "cache lookup failed for property %u", propoid);
+		return NULL;
+	}
+	propname = pstrdup(NameStr(((Form_pg_propgraph_property) GETSTRUCT(tuple))->pgpname));
+	ReleaseSysCache(tuple);
+
+	return propname;
 }

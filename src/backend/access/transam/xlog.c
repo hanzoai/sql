@@ -75,6 +75,7 @@
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/datachecksum_state.h"
 #include "postmaster/startup.h"
 #include "postmaster/walsummarizer.h"
 #include "postmaster/walwriter.h"
@@ -92,8 +93,10 @@
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/procsignal.h"
 #include "storage/reinit.h"
 #include "storage/spin.h"
+#include "storage/subsystems.h"
 #include "storage/sync.h"
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
@@ -105,6 +108,7 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+#include "utils/wait_event.h"
 
 #ifdef WAL_DEBUG
 #include "utils/memutils.h"
@@ -552,6 +556,9 @@ typedef struct XLogCtlData
 	 */
 	XLogRecPtr	lastFpwDisableRecPtr;
 
+	/* last data_checksum_version we've seen */
+	uint32		data_checksum_version;
+
 	slock_t		info_lck;		/* locks shared variables shown above */
 } XLogCtlData;
 
@@ -573,7 +580,18 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
 /*
  * We maintain an image of pg_control in shared memory.
  */
+static ControlFileData *LocalControlFile = NULL;
 static ControlFileData *ControlFile = NULL;
+
+static void XLOGShmemRequest(void *arg);
+static void XLOGShmemInit(void *arg);
+static void XLOGShmemAttach(void *arg);
+
+const ShmemCallbacks XLOGShmemCallbacks = {
+	.request_fn = XLOGShmemRequest,
+	.init_fn = XLOGShmemInit,
+	.attach_fn = XLOGShmemAttach,
+};
 
 /*
  * Calculate the amount of space left on the page after 'endptr'. Beware
@@ -649,6 +667,21 @@ static XLogRecPtr LocalMinRecoveryPoint;
 static TimeLineID LocalMinRecoveryPointTLI;
 static bool updateMinRecoveryPoint = true;
 
+/*
+ * Local state for ControlFile data_checksum_version.  After initialization
+ * this is only updated when absorbing a procsignal barrier during interrupt
+ * processing.  The reason for keeping a copy in backend-private memory is to
+ * avoid locking for interrogating the data checksum state.  Possible values
+ * are the data checksum versions defined in storage/checksum.h.
+ */
+static ChecksumStateType LocalDataChecksumState = 0;
+
+/*
+ * Variable backing the GUC, keep it in sync with LocalDataChecksumState.
+ * See SetLocalDataChecksumState().
+ */
+int			data_checksums = 0;
+
 /* For WALInsertLockAcquire/Release functions */
 static int	MyLockNo = 0;
 static bool holdingAllLocks = false;
@@ -715,6 +748,8 @@ static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
+
+static void XLogChecksums(uint32 new_type);
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -1165,7 +1200,7 @@ ReserveXLogInsertLocation(int size, XLogRecPtr *StartPos, XLogRecPtr *EndPos,
  * *EndPos value. However, if we are already at the beginning of the current
  * segment, *StartPos and *EndPos are set to the current location without
  * reserving any space, and the function returns false.
-*/
+ */
 static bool
 ReserveXLogSwitch(XLogRecPtr *StartPos, XLogRecPtr *EndPos, XLogRecPtr *PrevPtr)
 {
@@ -1990,7 +2025,6 @@ XLogRecPtrToBytePos(XLogRecPtr ptr)
 static void
 AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 {
-	XLogCtlInsert *Insert = &XLogCtl->Insert;
 	int			nextidx;
 	XLogRecPtr	OldPageRqstPtr;
 	XLogwrtRqst WriteRqst;
@@ -2113,22 +2147,6 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 		NewPage->xlp_pageaddr = NewPageBeginPtr;
 
 		/* NewPage->xlp_rem_len = 0; */	/* done by memset */
-
-		/*
-		 * If online backup is not in progress, mark the header to indicate
-		 * that WAL records beginning in this page have removable backup
-		 * blocks.  This allows the WAL archiver to know whether it is safe to
-		 * compress archived WAL data by transforming full-block records into
-		 * the non-full-block format.  It is sufficient to record this at the
-		 * page level because we force a page switch (in fact a segment
-		 * switch) when starting a backup, so the flag will be off before any
-		 * records can be written during the backup.  At the end of a backup,
-		 * the last page will be marked as all unsafe when perhaps only part
-		 * is unsafe, but at worst the archiver would miss the opportunity to
-		 * compress a few records.
-		 */
-		if (Insert->runningBackups == 0)
-			NewPage->xlp_info |= XLP_BKP_REMOVABLE;
 
 		/*
 		 * If first page of an XLOG segment file, make it a long header.
@@ -2918,12 +2936,10 @@ XLogFlush(XLogRecPtr record)
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());
 
 	/*
-	 * If we flushed an LSN that someone was waiting for, notify the waiters.
+	 * Wake up processes waiting for primary flush LSN to reach current flush
+	 * position.
 	 */
-	if (waitLSNState &&
-		(LogwrtResult.Flush >=
-		 pg_atomic_read_u64(&waitLSNState->minWaitedLSN[WAIT_LSN_TYPE_PRIMARY_FLUSH])))
-		WaitLSNWakeup(WAIT_LSN_TYPE_PRIMARY_FLUSH, LogwrtResult.Flush);
+	WaitLSNWakeup(WAIT_LSN_TYPE_PRIMARY_FLUSH, LogwrtResult.Flush);
 
 	/*
 	 * If we still haven't flushed to the request point then we have a
@@ -3108,12 +3124,10 @@ XLogBackgroundFlush(void)
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());
 
 	/*
-	 * If we flushed an LSN that someone was waiting for, notify the waiters.
+	 * Wake up processes waiting for primary flush LSN to reach current flush
+	 * position.
 	 */
-	if (waitLSNState &&
-		(LogwrtResult.Flush >=
-		 pg_atomic_read_u64(&waitLSNState->minWaitedLSN[WAIT_LSN_TYPE_PRIMARY_FLUSH])))
-		WaitLSNWakeup(WAIT_LSN_TYPE_PRIMARY_FLUSH, LogwrtResult.Flush);
+	WaitLSNWakeup(WAIT_LSN_TYPE_PRIMARY_FLUSH, LogwrtResult.Flush);
 
 	/*
 	 * Great, done. To take some work off the critical path, try to initialize
@@ -4270,6 +4284,12 @@ InitControlFile(uint64 sysidentifier, uint32 data_checksum_version)
 	ControlFile->wal_log_hints = wal_log_hints;
 	ControlFile->track_commit_timestamp = track_commit_timestamp;
 	ControlFile->data_checksum_version = data_checksum_version;
+
+	/*
+	 * Set the data_checksum_version value into XLogCtl, which is where all
+	 * processes get the current value from.
+	 */
+	XLogCtl->data_checksum_version = data_checksum_version;
 }
 
 static void
@@ -4604,10 +4624,6 @@ ReadControlFile(void)
 		(SizeOfXLogLongPHD - SizeOfXLogShortPHD);
 
 	CalculateCheckpointSegments();
-
-	/* Make the initdb settings visible as GUC variables, too */
-	SetConfigOption("data_checksums", DataChecksumsEnabled() ? "yes" : "no",
-					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 }
 
 /*
@@ -4641,13 +4657,328 @@ GetMockAuthenticationNonce(void)
 }
 
 /*
- * Are checksums enabled for data pages?
+ * DataChecksumsNeedWrite
+ *		Returns whether data checksums must be written or not
+ *
+ * Returns true if data checksums are enabled, or are in the process of being
+ * enabled. During "inprogress-on" and "inprogress-off" states checksums must
+ * be written even though they are not verified (see datachecksum_state.c for
+ * a longer discussion).
+ *
+ * This function is intended for callsites which are about to write a data page
+ * to storage, and need to know whether to re-calculate the checksum for the
+ * page header. Calling this function must be performed as close to the write
+ * operation as possible to keep the critical section short.
  */
 bool
-DataChecksumsEnabled(void)
+DataChecksumsNeedWrite(void)
 {
-	Assert(ControlFile != NULL);
-	return (ControlFile->data_checksum_version > 0);
+	return (LocalDataChecksumState == PG_DATA_CHECKSUM_VERSION ||
+			LocalDataChecksumState == PG_DATA_CHECKSUM_INPROGRESS_ON ||
+			LocalDataChecksumState == PG_DATA_CHECKSUM_INPROGRESS_OFF);
+}
+
+
+bool
+DataChecksumsOff(void)
+{
+	bool		ret;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	ret = (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_OFF);
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	return ret;
+}
+
+bool
+DataChecksumsOn(void)
+{
+	bool		ret;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	ret = (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_VERSION);
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	return ret;
+}
+
+bool
+DataChecksumsInProgressOn(void)
+{
+	bool		ret;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	ret = (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON);
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	return ret;
+}
+
+/*
+ * DataChecksumsNeedVerify
+ *		Returns whether data checksums must be verified or not
+ *
+ * Data checksums are only verified if they are fully enabled in the cluster.
+ * During the "inprogress-on" and "inprogress-off" states they are only
+ * updated, not verified (see datachecksum_state.c for a longer discussion).
+ *
+ * This function is intended for callsites which have read data and are about
+ * to perform checksum validation based on the result of this.  Calling this
+ * function must be performed as close to the validation call as possible to
+ * keep the critical section short. This is in order to protect against time of
+ * check/time of use situations around data checksum validation.
+ */
+bool
+DataChecksumsNeedVerify(void)
+{
+	return (LocalDataChecksumState == PG_DATA_CHECKSUM_VERSION);
+}
+
+/*
+ * SetDataChecksumsOnInProgress
+ *		Sets the data checksum state to "inprogress-on" to enable checksums
+ *
+ * To start the process of enabling data checksums in a running cluster the
+ * data_checksum_version state must be changed to "inprogress-on". See
+ * SetDataChecksumsOn below for a description on how this state change works.
+ * This function blocks until all backends in the cluster have acknowledged the
+ * state transition.
+ */
+void
+SetDataChecksumsOnInProgress(void)
+{
+	uint64		barrier;
+
+	/*
+	 * The state transition is performed in a critical section with
+	 * checkpoints held off to provide crash safety.
+	 */
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+
+	XLogChecksums(PG_DATA_CHECKSUM_INPROGRESS_ON);
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_ON;
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_ON;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+
+	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_ON);
+
+	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	END_CRIT_SECTION();
+
+	WaitForProcSignalBarrier(barrier);
+}
+
+/*
+ * SetDataChecksumsOn
+ *		Set data checksums state to 'on' cluster-wide
+ *
+ * Enabling data checksums is performed using two barriers, the first one to
+ * set the state to "inprogress-on" (done by SetDataChecksumsOnInProgress())
+ * and the second one to set the state to "on" (done here). Below is a short
+ * description of the processing, a more detailed write-up can be found in
+ * datachecksum_state.c.
+ *
+ * To start the process of enabling data checksums in a running cluster the
+ * data_checksum_version state must be changed to "inprogress-on".  This state
+ * requires data checksums to be written but not verified. This ensures that
+ * all data pages can be checksummed without the risk of false negatives in
+ * validation during the process.  When all existing pages are guaranteed to
+ * have checksums, and all new pages will be initiated with checksums, the
+ * state can be changed to "on". Once the state is "on" checksums will be both
+ * written and verified.
+ *
+ * This function blocks until all backends in the cluster have acknowledged the
+ * state transition.
+ */
+void
+SetDataChecksumsOn(void)
+{
+	uint64		barrier;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+
+	/*
+	 * The only allowed state transition to "on" is from "inprogress-on" since
+	 * that state ensures that all pages will have data checksums written. Any
+	 * other attempted state transition is likely due to a programmer error.
+	 */
+	if (XLogCtl->data_checksum_version != PG_DATA_CHECKSUM_INPROGRESS_ON)
+	{
+		SpinLockRelease(&XLogCtl->info_lck);
+		elog(WARNING,
+			 "cannot set data checksums to \"on\", current state is not \"inprogress-on\", disabling");
+		SetDataChecksumsOff();
+		return;
+	}
+
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	INJECTION_POINT("datachecksums-enable-checksums-delay", NULL);
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+
+	XLogChecksums(PG_DATA_CHECKSUM_VERSION);
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_VERSION;
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	/*
+	 * Update the controlfile before waiting since if we have an immediate
+	 * shutdown while waiting we want to come back up with checksums enabled.
+	 */
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_VERSION;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+
+	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_ON);
+
+	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	END_CRIT_SECTION();
+
+	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
+	WaitForProcSignalBarrier(barrier);
+}
+
+/*
+ * SetDataChecksumsOff
+ *		Disables data checksums cluster-wide
+ *
+ * Disabling data checksums must be performed with two sets of barriers, each
+ * carrying a different state. The state is first set to "inprogress-off"
+ * during which checksums are still written but not verified. This ensures that
+ * backends which have yet to observe the state change from "on" won't get
+ * validation errors on concurrently modified pages. Once all backends have
+ * changed to "inprogress-off", the barrier for moving to "off" can be emitted.
+ * This function blocks until all backends in the cluster have acknowledged the
+ * state transition.
+ */
+void
+SetDataChecksumsOff(void)
+{
+	uint64		barrier;
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+
+	/* If data checksums are already disabled there is nothing to do */
+	if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_OFF)
+	{
+		SpinLockRelease(&XLogCtl->info_lck);
+		return;
+	}
+
+	/*
+	 * If data checksums are currently enabled, or in the process of being
+	 * enabled, we first transition to the "inprogress-off" state during which
+	 * backends continue to write checksums without verifying them. When all
+	 * backends are in "inprogress-off" the next transition to "off" can be
+	 * performed, after which all data checksum processing is disabled.
+	 */
+	if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_VERSION ||
+		XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON)
+	{
+		SpinLockRelease(&XLogCtl->info_lck);
+
+		START_CRIT_SECTION();
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+
+		XLogChecksums(PG_DATA_CHECKSUM_INPROGRESS_OFF);
+
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_OFF;
+		SpinLockRelease(&XLogCtl->info_lck);
+
+		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+		ControlFile->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_OFF;
+		UpdateControlFile();
+		LWLockRelease(ControlFileLock);
+
+		barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_OFF);
+
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		END_CRIT_SECTION();
+
+		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
+		WaitForProcSignalBarrier(barrier);
+
+		/*
+		 * At this point we know that no backends are verifying data checksums
+		 * during reading. Next, we can safely move to state "off" to also
+		 * stop writing checksums.
+		 */
+	}
+	else
+	{
+		/*
+		 * Ending up here implies that the checksums state is "inprogress-off"
+		 * and we can transition directly to "off" from there.
+		 */
+		SpinLockRelease(&XLogCtl->info_lck);
+	}
+
+	START_CRIT_SECTION();
+	/* Ensure that we don't incur a checkpoint during disabling checksums */
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+
+	XLogChecksums(PG_DATA_CHECKSUM_OFF);
+
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_OFF;
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_OFF;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
+
+	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_OFF);
+
+	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	END_CRIT_SECTION();
+
+	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
+	WaitForProcSignalBarrier(barrier);
+}
+
+/*
+ * InitLocalDataChecksumState
+ *
+ * Set up backend local caches of controldata variables which may change at
+ * any point during runtime and thus require special cased locking. So far
+ * this only applies to data_checksum_version, but it's intended to be general
+ * purpose enough to handle future cases.
+ */
+void
+InitLocalDataChecksumState(void)
+{
+	Assert(InterruptHoldoffCount > 0);
+	SpinLockAcquire(&XLogCtl->info_lck);
+	SetLocalDataChecksumState(XLogCtl->data_checksum_version);
+	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+void
+SetLocalDataChecksumState(uint32 data_checksum_version)
+{
+	LocalDataChecksumState = data_checksum_version;
+
+	data_checksums = data_checksum_version;
+}
+
+/* guc hook */
+const char *
+show_data_checksums(void)
+{
+	return get_checksum_state_string(LocalDataChecksumState);
 }
 
 /*
@@ -4715,7 +5046,7 @@ check_wal_buffers(int *newval, void **extra, GucSource source)
 	{
 		/*
 		 * If we haven't yet changed the boot_val default of -1, just let it
-		 * be.  We'll fix it when XLOGShmemSize is called.
+		 * be.  We'll fix it when XLOGShmemRequest is called.
 		 */
 		if (XLOGbuffers == -1)
 			return true;
@@ -4939,8 +5270,10 @@ void
 LocalProcessControlFile(bool reset)
 {
 	Assert(reset || ControlFile == NULL);
-	ControlFile = palloc_object(ControlFileData);
+	LocalControlFile = palloc_object(ControlFileData);
+	ControlFile = LocalControlFile;
 	ReadControlFile();
+	SetLocalDataChecksumState(ControlFile->data_checksum_version);
 }
 
 /*
@@ -4955,10 +5288,10 @@ GetActiveWalLevelOnStandby(void)
 }
 
 /*
- * Initialization of shared memory for XLOG
+ * Register shared memory for XLOG.
  */
-Size
-XLOGShmemSize(void)
+static void
+XLOGShmemRequest(void *arg)
 {
 	Size		size;
 
@@ -4998,23 +5331,24 @@ XLOGShmemSize(void)
 	/* and the buffers themselves */
 	size = add_size(size, mul_size(XLOG_BLCKSZ, XLOGbuffers));
 
-	/*
-	 * Note: we don't count ControlFileData, it comes out of the "slop factor"
-	 * added by CreateSharedMemoryAndSemaphores.  This lets us use this
-	 * routine again below to compute the actual allocation size.
-	 */
-
-	return size;
+	ShmemRequestStruct(.name = "XLOG Ctl",
+					   .size = size,
+					   .ptr = (void **) &XLogCtl,
+		);
+	ShmemRequestStruct(.name = "Control File",
+					   .size = sizeof(ControlFileData),
+					   .ptr = (void **) &ControlFile,
+		);
 }
 
-void
-XLOGShmemInit(void)
+/*
+ * XLOGShmemInit - initialize the XLogCtl shared memory area.
+ */
+static void
+XLOGShmemInit(void *arg)
 {
-	bool		foundCFile,
-				foundXLog;
 	char	   *allocptr;
 	int			i;
-	ControlFileData *localControlFile;
 
 #ifdef WAL_DEBUG
 
@@ -5032,36 +5366,17 @@ XLOGShmemInit(void)
 	}
 #endif
 
-
-	XLogCtl = (XLogCtlData *)
-		ShmemInitStruct("XLOG Ctl", XLOGShmemSize(), &foundXLog);
-
-	localControlFile = ControlFile;
-	ControlFile = (ControlFileData *)
-		ShmemInitStruct("Control File", sizeof(ControlFileData), &foundCFile);
-
-	if (foundCFile || foundXLog)
-	{
-		/* both should be present or neither */
-		Assert(foundCFile && foundXLog);
-
-		/* Initialize local copy of WALInsertLocks */
-		WALInsertLocks = XLogCtl->Insert.WALInsertLocks;
-
-		if (localControlFile)
-			pfree(localControlFile);
-		return;
-	}
 	memset(XLogCtl, 0, sizeof(XLogCtlData));
 
 	/*
 	 * Already have read control file locally, unless in bootstrap mode. Move
 	 * contents into shared memory.
 	 */
-	if (localControlFile)
+	if (LocalControlFile)
 	{
-		memcpy(ControlFile, localControlFile, sizeof(ControlFileData));
-		pfree(localControlFile);
+		memcpy(ControlFile, LocalControlFile, sizeof(ControlFileData));
+		pfree(LocalControlFile);
+		LocalControlFile = NULL;
 	}
 
 	/*
@@ -5110,12 +5425,25 @@ XLOGShmemInit(void)
 	XLogCtl->InstallXLogFileSegmentActive = false;
 	XLogCtl->WalWriterSleeping = false;
 
+	/* Use the checksum info from control file */
+	XLogCtl->data_checksum_version = ControlFile->data_checksum_version;
+	SetLocalDataChecksumState(XLogCtl->data_checksum_version);
+
 	SpinLockInit(&XLogCtl->Insert.insertpos_lck);
 	SpinLockInit(&XLogCtl->info_lck);
 	pg_atomic_init_u64(&XLogCtl->logInsertResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
+}
+
+/*
+ * XLOGShmemAttach - re-establish WALInsertLocks pointer after attaching.
+ */
+static void
+XLOGShmemAttach(void *arg)
+{
+	WALInsertLocks = XLogCtl->Insert.WALInsertLocks;
 }
 
 /*
@@ -5184,6 +5512,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	checkPoint.newestCommitTsXid = InvalidTransactionId;
 	checkPoint.time = (pg_time_t) time(NULL);
 	checkPoint.oldestActiveXid = InvalidTransactionId;
+	checkPoint.dataChecksumState = data_checksum_version;
 
 	TransamVariables->nextXid = checkPoint.nextXid;
 	TransamVariables->nextOid = checkPoint.nextOid;
@@ -6261,6 +6590,50 @@ StartupXLOG(void)
 	pfree(endOfRecoveryInfo);
 
 	/*
+	 * If we reach this point with checksums in the state inprogress-on, it
+	 * means that data checksums were in the process of being enabled when the
+	 * cluster shut down. Since processing didn't finish, the operation will
+	 * have to be restarted from scratch since there is no capability to
+	 * continue where it was when the cluster shut down. Thus, revert the
+	 * state back to off, and inform the user with a warning message. Being
+	 * able to restart processing is a TODO, but it wouldn't be possible to
+	 * restart here since we cannot launch a dynamic background worker
+	 * directly from here (it has to be from a regular backend).
+	 */
+	if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON)
+	{
+		XLogChecksums(PG_DATA_CHECKSUM_OFF);
+
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_OFF;
+		SetLocalDataChecksumState(XLogCtl->data_checksum_version);
+		SpinLockRelease(&XLogCtl->info_lck);
+
+		EmitAndWaitDataChecksumsBarrier(PG_DATA_CHECKSUM_OFF);
+		ereport(WARNING,
+				errmsg("enabling data checksums was interrupted"),
+				errhint("Data checksum processing must be manually restarted for checksums to be enabled."));
+	}
+
+	/*
+	 * If data checksums were being disabled when the cluster was shut down,
+	 * we know that we have a state where all backends have stopped validating
+	 * checksums and we can move to off instead of prompting the user to
+	 * perform any action.
+	 */
+	else if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+	{
+		XLogChecksums(PG_DATA_CHECKSUM_OFF);
+
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_OFF;
+		SetLocalDataChecksumState(XLogCtl->data_checksum_version);
+		SpinLockRelease(&XLogCtl->info_lck);
+
+		EmitAndWaitDataChecksumsBarrier(PG_DATA_CHECKSUM_OFF);
+	}
+
+	/*
 	 * All done with end-of-recovery actions.
 	 *
 	 * Now allow backends to write WAL and update the control file status in
@@ -6279,6 +6652,7 @@ StartupXLOG(void)
 	ControlFile->state = DB_IN_PRODUCTION;
 
 	SpinLockAcquire(&XLogCtl->info_lck);
+	ControlFile->data_checksum_version = XLogCtl->data_checksum_version;
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
@@ -6565,7 +6939,7 @@ GetRedoRecPtr(void)
 	XLogRecPtr	ptr;
 
 	/*
-	 * The possibly not up-to-date copy in XlogCtl is enough. Even if we
+	 * The possibly not up-to-date copy in XLogCtl is enough. Even if we
 	 * grabbed a WAL insertion lock to read the authoritative value in
 	 * Insert->RedoRecPtr, someone might update it just after we've released
 	 * the lock.
@@ -7143,6 +7517,14 @@ CreateCheckPoint(int flags)
 	checkPoint.fullPageWrites = Insert->fullPageWrites;
 	checkPoint.wal_level = wal_level;
 
+	/*
+	 * Get the current data_checksum_version value from xlogctl, valid at the
+	 * time of the checkpoint.
+	 */
+	SpinLockAcquire(&XLogCtl->info_lck);
+	checkPoint.dataChecksumState = XLogCtl->data_checksum_version;
+	SpinLockRelease(&XLogCtl->info_lck);
+
 	if (shutdown)
 	{
 		XLogRecPtr	curInsert = XLogBytePosToRecPtr(Insert->CurrBytePos);
@@ -7195,9 +7577,18 @@ CreateCheckPoint(int flags)
 	 */
 	if (!shutdown)
 	{
+		xl_checkpoint_redo redo_rec;
+
+		WALInsertLockAcquire();
+		redo_rec.wal_level = wal_level;
+		SpinLockAcquire(&XLogCtl->info_lck);
+		redo_rec.data_checksum_version = XLogCtl->data_checksum_version;
+		SpinLockRelease(&XLogCtl->info_lck);
+		WALInsertLockRelease();
+
 		/* Include WAL level in record for WAL summarizer's benefit. */
 		XLogBeginInsert();
-		XLogRegisterData(&wal_level, sizeof(wal_level));
+		XLogRegisterData(&redo_rec, sizeof(xl_checkpoint_redo));
 		(void) XLogInsert(RM_XLOG_ID, XLOG_CHECKPOINT_REDO);
 
 		/*
@@ -7545,6 +7936,12 @@ CreateEndOfRecoveryRecord(void)
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->minRecoveryPoint = recptr;
 	ControlFile->minRecoveryPointTLI = xlrec.ThisTimeLineID;
+
+	/* start with the latest checksum version (as of the end of recovery) */
+	SpinLockAcquire(&XLogCtl->info_lck);
+	ControlFile->data_checksum_version = XLogCtl->data_checksum_version;
+	SpinLockRelease(&XLogCtl->info_lck);
+
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
 
@@ -7886,6 +8283,10 @@ CreateRestartPoint(int flags)
 			if (flags & CHECKPOINT_IS_SHUTDOWN)
 				ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
 		}
+
+		/* we shall start with the latest checksum version */
+		ControlFile->data_checksum_version = lastCheckPoint.dataChecksumState;
+
 		UpdateControlFile();
 	}
 	LWLockRelease(ControlFileLock);
@@ -8241,6 +8642,30 @@ XLogRestorePoint(const char *rpName)
 }
 
 /*
+ * Write an empty XLOG record to assign a distinct LSN.
+ *
+ * This is used by some index AMs when building indexes on permanent relations
+ * with wal_level=minimal.  In that scenario, WAL-logging will start after
+ * commit, but the index AM needs distinct LSNs to detect concurrent page
+ * modifications.  When the current WAL insert position hasn't advanced since
+ * the last call, we emit a dummy record to ensure we get a new, distinct LSN.
+ */
+XLogRecPtr
+XLogAssignLSN(void)
+{
+	int			dummy = 0;
+
+	/*
+	 * Records other than XLOG_SWITCH must have content.  We use an integer 0
+	 * to satisfy this restriction.
+	 */
+	XLogBeginInsert();
+	XLogSetRecordFlags(XLOG_MARK_UNIMPORTANT);
+	XLogRegisterData(&dummy, sizeof(dummy));
+	return XLogInsert(RM_XLOG_ID, XLOG_ASSIGN_LSN);
+}
+
+/*
  * Check if any of the GUC parameters that are critical for hot standby
  * have changed, and update the value in pg_control file if necessary.
  */
@@ -8298,6 +8723,24 @@ XLogReportParameters(void)
 
 		LWLockRelease(ControlFileLock);
 	}
+}
+
+/*
+ * Log the new state of checksums
+ */
+static void
+XLogChecksums(uint32 new_type)
+{
+	xl_checksum_state xlrec;
+	XLogRecPtr	recptr;
+
+	xlrec.new_checksum_state = new_type;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, sizeof(xl_checksum_state));
+
+	recptr = XLogInsert(RM_XLOG2_ID, XLOG2_CHECKSUMS);
+	XLogFlush(recptr);
 }
 
 /*
@@ -8485,6 +8928,9 @@ xlog_redo(XLogReaderState *record)
 		/* ControlFile->checkPointCopy always tracks the latest ckpt XID */
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->checkPointCopy.nextXid = checkPoint.nextXid;
+		ControlFile->data_checksum_version = checkPoint.dataChecksumState;
+
+		UpdateControlFile();
 		LWLockRelease(ControlFileLock);
 
 		/*
@@ -8607,6 +9053,10 @@ xlog_redo(XLogReaderState *record)
 	{
 		/* nothing to do here, handled in xlogrecovery.c */
 	}
+	else if (info == XLOG_ASSIGN_LSN)
+	{
+		/* nothing to do here, see XLogGetFakeLSN() */
+	}
 	else if (info == XLOG_FPI || info == XLOG_FPI_FOR_HINT)
 	{
 		/*
@@ -8717,7 +9167,20 @@ xlog_redo(XLogReaderState *record)
 	}
 	else if (info == XLOG_CHECKPOINT_REDO)
 	{
-		/* nothing to do here, just for informational purposes */
+		xl_checkpoint_redo redo_rec;
+		bool		new_state = false;
+
+		memcpy(&redo_rec, XLogRecGetData(record), sizeof(xl_checkpoint_redo));
+
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->data_checksum_version = redo_rec.data_checksum_version;
+		SetLocalDataChecksumState(redo_rec.data_checksum_version);
+		if (redo_rec.data_checksum_version != ControlFile->data_checksum_version)
+			new_state = true;
+		SpinLockRelease(&XLogCtl->info_lck);
+
+		if (new_state)
+			EmitAndWaitDataChecksumsBarrier(redo_rec.data_checksum_version);
 	}
 	else if (info == XLOG_LOGICAL_DECODING_STATUS_CHANGE)
 	{
@@ -8767,6 +9230,35 @@ xlog_redo(XLogReaderState *record)
 				kill(PostmasterPid, SIGUSR1);
 			}
 		}
+	}
+}
+
+void
+xlog2_redo(XLogReaderState *record)
+{
+	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+
+	if (info == XLOG2_CHECKSUMS)
+	{
+		xl_checksum_state state;
+
+		memcpy(&state, XLogRecGetData(record), sizeof(xl_checksum_state));
+
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->data_checksum_version = state.new_checksum_state;
+		SpinLockRelease(&XLogCtl->info_lck);
+
+		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+		ControlFile->data_checksum_version = state.new_checksum_state;
+		UpdateControlFile();
+		LWLockRelease(ControlFileLock);
+
+		/*
+		 * Block on a procsignalbarrier to await all processes having seen the
+		 * change to checksum status. Once the barrier has been passed we can
+		 * initiate the corresponding processing.
+		 */
+		EmitAndWaitDataChecksumsBarrier(state.new_checksum_state);
 	}
 }
 
@@ -9036,12 +9528,6 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 		 * recovery: we won't have a history file covering the old timeline if
 		 * pg_wal directory was not included in the base backup and the WAL
 		 * archive was cleared too before starting the backup.
-		 *
-		 * This also ensures that we have emitted a WAL page header that has
-		 * XLP_BKP_REMOVABLE off before we emit the checkpoint record.
-		 * Therefore, if a WAL archiver (such as pglesslog) is trying to
-		 * compress out removable backup blocks, it won't remove any that
-		 * occur after this point.
 		 *
 		 * During recovery, we skip forcing XLOG file switch, which means that
 		 * the backup taken during recovery is not available for the special
@@ -9615,6 +10101,22 @@ GetXLogInsertRecPtr(void)
 	SpinLockRelease(&Insert->insertpos_lck);
 
 	return XLogBytePosToRecPtr(current_bytepos);
+}
+
+/*
+ * Get latest WAL record end pointer
+ */
+XLogRecPtr
+GetXLogInsertEndRecPtr(void)
+{
+	XLogCtlInsert *Insert = &XLogCtl->Insert;
+	uint64		current_bytepos;
+
+	SpinLockAcquire(&Insert->insertpos_lck);
+	current_bytepos = Insert->CurrBytePos;
+	SpinLockRelease(&Insert->insertpos_lck);
+
+	return XLogBytePosToEndRecPtr(current_bytepos);
 }
 
 /*

@@ -81,14 +81,16 @@ override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
 
 ##########################################################################
 
-all: submake-libpgport submake-catalog-headers submake-utils-headers postgres
+all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP)
 
 ifneq ($(PORTNAME), cygwin)
 ifneq ($(PORTNAME), win32)
+ifneq ($(PORTNAME), aix)
 
 postgres: $(OBJS)
 	$(CC) $(CFLAGS) $(call expand_subsys,$^) $(LDFLAGS) $(LIBS) -o $@
 
+endif
 endif
 endif
 
@@ -116,6 +118,24 @@ libpostgres.a: postgres
 	touch $@
 
 endif # win32
+
+ifeq ($(PORTNAME), aix)
+
+postgres: $(POSTGRES_IMP)
+	$(CC) $(CFLAGS) $(call expand_subsys,$(OBJS)) $(LDFLAGS) -Wl,-bE:$(top_builddir)/src/backend/$(POSTGRES_IMP) $(LIBS) -Wl,-brtllib -o $@
+
+# Linking to a single .o with -r is a lot faster than building a .a or passing
+# all objects to MKLDEXPORT.
+#
+# It looks alluring to use $(CC) -r instead of ld -r, but that doesn't
+# trivially work with gcc, due to gcc specific static libraries linked in with
+# -r.
+$(POSTGRES_IMP): $(OBJS)
+	ld -b64 -r -o SUBSYS.o $(call expand_subsys,$^)
+	$(MKLDEXPORT) SUBSYS.o . > $@
+	@rm -f SUBSYS.o
+
+endif # aix
 
 $(top_builddir)/src/port/libpgport_srv.a: | submake-libpgport
 
@@ -201,6 +221,7 @@ endif
 	$(MAKE) -C utils install-data
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_hba.conf.sample '$(DESTDIR)$(datadir)/pg_hba.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_ident.conf.sample '$(DESTDIR)$(datadir)/pg_ident.conf.sample'
+	$(INSTALL_DATA) $(srcdir)/libpq/pg_hosts.conf.sample '$(DESTDIR)$(datadir)/pg_hosts.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/utils/misc/postgresql.conf.sample '$(DESTDIR)$(datadir)/postgresql.conf.sample'
 
 ifeq ($(with_llvm), yes)
@@ -210,8 +231,12 @@ install-postgres-bitcode: $(OBJS) all
 	$(call install_llvm_module,postgres,$(call expand_subsys, $(filter-out $(top_builddir)/src/timezone/objfiles.txt, $(SUBDIROBJS))))
 endif
 
-install-bin: postgres installdirs
+install-bin: postgres $(POSTGRES_IMP) installdirs
 	$(INSTALL_PROGRAM) postgres$(X) '$(DESTDIR)$(bindir)/postgres$(X)'
+ifeq ($(MAKE_EXPORTS), true)
+	$(INSTALL_DATA) $(POSTGRES_IMP) '$(DESTDIR)$(pkglibdir)/$(POSTGRES_IMP)'
+	$(INSTALL_PROGRAM) $(MKLDEXPORT) '$(DESTDIR)$(pgxsdir)/$(MKLDEXPORT_DIR)/mkldexport.sh'
+endif
 
 .PHONY: install-bin
 
@@ -227,12 +252,20 @@ ifeq ($(MAKE_DLL), true)
 	$(MKDIR_P) '$(DESTDIR)$(libdir)'
 endif
 endif
+ifeq ($(MAKE_EXPORTS), true)
+	$(MKDIR_P) '$(DESTDIR)$(pkglibdir)'
+	$(MKDIR_P) '$(DESTDIR)$(pgxsdir)/$(MKLDEXPORT_DIR)'
+endif
 
 
 ##########################################################################
 
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/postgres$(X)'
+ifeq ($(MAKE_EXPORTS), true)
+	rm -f '$(DESTDIR)$(pkglibdir)/$(POSTGRES_IMP)'
+	rm -f '$(DESTDIR)$(pgxsdir)/$(MKLDEXPORT_DIR)/mkldexport.sh'
+endif
 ifeq ($(PORTNAME), cygwin)
 ifeq ($(MAKE_DLL), true)
 	rm -f '$(DESTDIR)$(libdir)/libpostgres.a'
@@ -248,6 +281,7 @@ endif
 	$(MAKE) -C utils uninstall-data
 	rm -f '$(DESTDIR)$(datadir)/pg_hba.conf.sample' \
 	      '$(DESTDIR)$(datadir)/pg_ident.conf.sample' \
+	      '$(DESTDIR)$(datadir)/pg_hosts.conf.sample' \
 	      '$(DESTDIR)$(datadir)/postgresql.conf.sample'
 ifeq ($(with_llvm), yes)
 	$(call uninstall_llvm_module,postgres)
@@ -257,7 +291,7 @@ endif
 ##########################################################################
 
 clean:
-	rm -f $(LOCALOBJS) postgres$(X)
+	rm -f $(LOCALOBJS) postgres$(X) $(POSTGRES_IMP)
 ifeq ($(PORTNAME), cygwin)
 	rm -f postgres.dll libpostgres.a
 endif

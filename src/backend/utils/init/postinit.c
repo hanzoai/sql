@@ -38,6 +38,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
 #include "replication/slot.h"
@@ -592,7 +593,7 @@ InitializeFastPathLocks(void)
 	 * value at FP_LOCK_GROUPS_PER_BACKEND_MAX and insist the value is at
 	 * least 1.
 	 *
-	 * The default max_locks_per_transaction = 64 means 4 groups by default.
+	 * The default max_locks_per_transaction = 128 means 8 groups by default.
 	 */
 	FastPathLockGroupsPerBackend =
 		Max(Min(pg_nextpower2_32(max_locks_per_xact) / FP_LOCK_SLOTS_PER_GROUP,
@@ -661,9 +662,6 @@ BaseInit(void)
 	/* Initialize lock manager's local structs */
 	InitLockManagerAccess();
 
-	/* Initialize logical info WAL logging state */
-	InitializeProcessXLogLogicalInfo();
-
 	/*
 	 * Initialize replication slots after pgstat. The exit hook might need to
 	 * drop ephemeral slots, which in turn triggers stats reporting.
@@ -717,7 +715,7 @@ BaseInit(void)
 void
 InitPostgres(const char *in_dbname, Oid dboid,
 			 const char *username, Oid useroid,
-			 bits32 flags,
+			 uint32 flags,
 			 char *out_dbname)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
@@ -755,7 +753,35 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	SharedInvalBackendInit(false);
 
+	/*
+	 * Prevent consuming interrupts between setting ProcSignalInit and setting
+	 * the initial local data checksum value.  If a barrier is emitted, and
+	 * absorbed, before local cached state is initialized the state transition
+	 * can be invalid.
+	 */
+	HOLD_INTERRUPTS();
+
 	ProcSignalInit(MyCancelKey, MyCancelKeyLength);
+
+	/*
+	 * Initialize a local cache of the data_checksum_version, to be updated by
+	 * the procsignal-based barriers.
+	 *
+	 * This intentionally happens after initializing the procsignal, otherwise
+	 * we might miss a state change. This means we can get a barrier for the
+	 * state we've just initialized.
+	 *
+	 * The postmaster (which is what gets forked into the new child process)
+	 * does not handle barriers, therefore it may not have the current value
+	 * of LocalDataChecksumState value (it'll have the value read from the
+	 * control file, which may be arbitrarily old).
+	 *
+	 * NB: Even if the postmaster handled barriers, the value might still be
+	 * stale, as it might have changed after this process forked.
+	 */
+	InitLocalDataChecksumState();
+
+	RESUME_INTERRUPTS();
 
 	/*
 	 * Also set up timeout handlers needed for backend operation.  We need
@@ -803,6 +829,16 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		before_shmem_exit(pgstat_before_server_shutdown, 0);
 		before_shmem_exit(ShutdownXLOG, 0);
 	}
+
+	/*
+	 * Initialize the process-local logical info WAL logging state.
+	 *
+	 * This must be called after ProcSignalInit() so that the process can
+	 * participate in procsignal-based barriers that update this state.
+	 * Furthermore, in !IsUnderPostmaster cases, this must occur after
+	 * StartupXLOG() where the shared state is first established.
+	 */
+	InitializeProcessXLogLogicalInfo();
 
 	/*
 	 * Initialize the relation cache and the system catalog caches.  Note that
@@ -885,7 +921,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 					 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
 							 username != NULL ? username : "postgres")));
 	}
-	else if (AmBackgroundWorkerProcess())
+	else if (AmBackgroundWorkerProcess() || AmDataChecksumsWorkerProcess())
 	{
 		if (username == NULL && !OidIsValid(useroid))
 		{

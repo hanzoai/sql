@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 #include "access/sysattr.h"
+#include "access/transam.h"
 #include "catalog/pg_class.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
@@ -314,7 +315,7 @@ static ModifyTable *make_modifytable(PlannerInfo *root, Plan *subplan,
 									 List *withCheckOptionLists, List *returningLists,
 									 List *rowMarks, OnConflictExpr *onconflict,
 									 List *mergeActionLists, List *mergeJoinConditions,
-									 int epqParam);
+									 ForPortionOfExpr *forPortionOf, int epqParam);
 static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 											 GatherMergePath *best_path);
 
@@ -2675,6 +2676,7 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 							best_path->onconflict,
 							best_path->mergeActionLists,
 							best_path->mergeJoinConditions,
+							best_path->forPortionOf,
 							best_path->epqParam);
 
 	copy_generic_path_info(&plan->plan, &best_path->path);
@@ -5115,7 +5117,7 @@ fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
 	/*
 	 * Remove any PlaceHolderVar wrapping of the indexkey
 	 */
-	node = strip_phvs_in_index_operand(node);
+	node = strip_noop_phvs(node);
 
 	/*
 	 * Remove any binary-compatible relabeling of the indexkey
@@ -7008,7 +7010,7 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 				 List *withCheckOptionLists, List *returningLists,
 				 List *rowMarks, OnConflictExpr *onconflict,
 				 List *mergeActionLists, List *mergeJoinConditions,
-				 int epqParam)
+				 ForPortionOfExpr *forPortionOf, int epqParam)
 {
 	ModifyTable *node = makeNode(ModifyTable);
 	bool		returning_old_or_new = false;
@@ -7081,6 +7083,7 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 		node->exclRelTlist = onconflict->exclRelTlist;
 	}
 	node->updateColnosLists = updateColnosLists;
+	node->forPortionOf = (Node *) forPortionOf;
 	node->withCheckOptionLists = withCheckOptionLists;
 	node->returningOldAlias = root->parse->returningOldAlias;
 	node->returningNewAlias = root->parse->returningNewAlias;

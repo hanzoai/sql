@@ -30,6 +30,23 @@
 
 
 /*
+ * Reject building with gcc's -ffast-math switch.  It breaks our handling of
+ * float Infinity and NaN values (via -ffinite-math-only), causes results to
+ * be less accurate than expected (via -funsafe-math-optimizations and
+ * -fexcess-precision=fast), and causes some math error reports to be missed
+ * (via -fno-math-errno).  Unfortunately we can't easily detect cases where
+ * those options were given individually, but this at least catches the most
+ * obvious case.
+ *
+ * We test this only here, not in any header file, to allow extensions to use
+ * -ffast-math if they need to.  But the inline functions in float.h will
+ * misbehave in such an extension, so its authors had better be careful.
+ */
+#ifdef __FAST_MATH__
+#error -ffast-math is known to break this code
+#endif
+
+/*
  * Configurable GUC parameter
  *
  * If >0, use shortest-decimal format for output; this is both the default and
@@ -102,6 +119,30 @@ pg_noinline void
 float_zero_divide_error(void)
 {
 	ereport(ERROR,
+			(errcode(ERRCODE_DIVISION_BY_ZERO),
+			 errmsg("division by zero")));
+}
+
+float8
+float_overflow_error_ext(struct Node *escontext)
+{
+	ereturn(escontext, 0.0,
+			errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			errmsg("value out of range: overflow"));
+}
+
+float8
+float_underflow_error_ext(struct Node *escontext)
+{
+	ereturn(escontext, 0.0,
+			errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			errmsg("value out of range: underflow"));
+}
+
+float8
+float_zero_divide_error_ext(struct Node *escontext)
+{
+	ereturn(escontext, 0.0,
 			(errcode(ERRCODE_DIVISION_BY_ZERO),
 			 errmsg("division by zero")));
 }
@@ -1199,9 +1240,9 @@ dtof(PG_FUNCTION_ARGS)
 
 	result = (float4) num;
 	if (unlikely(isinf(result)) && !isinf(num))
-		float_overflow_error();
+		float_overflow_error_ext(fcinfo->context);
 	if (unlikely(result == 0.0f) && num != 0.0)
-		float_underflow_error();
+		float_underflow_error_ext(fcinfo->context);
 
 	PG_RETURN_FLOAT4(result);
 }
@@ -1224,7 +1265,7 @@ dtoi4(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT8_FITS_IN_INT32(num)))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("integer out of range")));
 
@@ -1249,7 +1290,7 @@ dtoi2(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT8_FITS_IN_INT16(num)))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
@@ -1298,7 +1339,7 @@ ftoi4(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT4_FITS_IN_INT32(num)))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("integer out of range")));
 
@@ -1323,7 +1364,7 @@ ftoi2(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT4_FITS_IN_INT16(num)))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
@@ -2851,6 +2892,12 @@ dlgamma(PG_FUNCTION_ARGS)
 {
 	float8		arg1 = PG_GETARG_FLOAT8(0);
 	float8		result;
+
+	/* On some versions of AIX, lgamma(NaN) fails with ERANGE */
+#if defined(_AIX)
+	if (isnan(arg1))
+		PG_RETURN_FLOAT8(arg1);
+#endif
 
 	/*
 	 * Note: lgamma may not be thread-safe because it may write to a global
