@@ -133,6 +133,7 @@ task:
       meson setup \
         --buildtype=debug \
         --auto-features=disabled \
+        -Ddefault_library=shared \
         -Dtap_tests=enabled \
         build
     EOF
@@ -446,7 +447,7 @@ task:
     # print_stacktraces=1,verbosity=2, duh
     # detect_leaks=0: too many uninteresting leak errors in short-lived binaries
     UBSAN_OPTIONS: print_stacktrace=1:disable_coredump=0:abort_on_error=1:verbosity=2
-    ASAN_OPTIONS: print_stacktrace=1:disable_coredump=0:abort_on_error=1:detect_leaks=0:detect_stack_use_after_return=0
+    ASAN_OPTIONS: print_stacktrace=1:disable_coredump=0:abort_on_error=1:detect_leaks=0
 
     # SANITIZER_FLAGS is set in the tasks below
     CFLAGS: -Og -ggdb -fno-sanitize-recover=all $SANITIZER_FLAGS
@@ -781,6 +782,7 @@ task:
     CIRRUS_WINDOWS_ERROR_MODE: 0x8001
 
     MESON_FEATURES:
+      -Dcpp_args=/std:c++20
       -Dauto_features=disabled
       -Dldap=enabled
       -Dssl=openssl
@@ -1003,6 +1005,7 @@ task:
   ###
   # Verify headerscheck / cpluspluscheck succeed
   #
+  # - Run both in same script to increase parallelism, use -k to get result of both
   # - Use -fmax-errors, as particularly cpluspluscheck can be very verbose
   ###
   always:
@@ -1013,9 +1016,7 @@ task:
         --quiet \
         CC="ccache gcc" CXX="ccache g++" CLANG="ccache clang"
       make -s -j${BUILD_JOBS} clean
-      time make -s headerscheck EXTRAFLAGS='-fmax-errors=10'
-    headers_cpluspluscheck_script: |
-      time make -s cpluspluscheck EXTRAFLAGS='-fmax-errors=10'
+      time make -s -j${BUILD_JOBS} -k ${CHECKFLAGS} headerscheck cpluspluscheck EXTRAFLAGS='-fmax-errors=10'
 
   always:
     upload_caches: ccache

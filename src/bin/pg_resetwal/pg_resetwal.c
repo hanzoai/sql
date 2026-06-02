@@ -188,7 +188,7 @@ main(int argc, char *argv[])
 				if (endptr == optarg || *endptr != '\0' || errno != 0)
 				{
 					/*------
-					  translator: the second %s is a command line argument (-e, etc) */
+					  translator: %s is a command line argument (-e, etc) */
 					pg_log_error("invalid argument for option %s", "-e");
 					pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 					exit(1);
@@ -307,7 +307,7 @@ main(int argc, char *argv[])
 				break;
 
 			case 'l':
-				if (strspn(optarg, "01234567890ABCDEFabcdef") != XLOG_FNAME_LEN)
+				if (strspn(optarg, "0123456789ABCDEFabcdef") != XLOG_FNAME_LEN)
 				{
 					pg_log_error("invalid argument for option %s", "-l");
 					pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -722,7 +722,7 @@ GuessControlValues(void)
 	ControlFile.max_wal_senders = 10;
 	ControlFile.max_worker_processes = 8;
 	ControlFile.max_prepared_xacts = 0;
-	ControlFile.max_locks_per_xact = 64;
+	ControlFile.max_locks_per_xact = 128;
 
 	ControlFile.maxAlign = MAXIMUM_ALIGNOF;
 	ControlFile.floatFormat = FLOATFORMAT_VALUE;
@@ -931,7 +931,7 @@ RewriteControlFile(void)
 	ControlFile.max_wal_senders = 10;
 	ControlFile.max_worker_processes = 8;
 	ControlFile.max_prepared_xacts = 0;
-	ControlFile.max_locks_per_xact = 64;
+	ControlFile.max_locks_per_xact = 128;
 
 	/* The control file gets flushed here. */
 	update_controlfile(".", &ControlFile, true);

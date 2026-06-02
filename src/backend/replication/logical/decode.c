@@ -33,6 +33,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "catalog/pg_control.h"
+#include "commands/repack.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/message.h"
@@ -186,6 +187,22 @@ xlog_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			break;
 		default:
 			elog(ERROR, "unexpected RM_XLOG_ID record type: %u", info);
+	}
+}
+
+void
+xlog2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	uint8		info = XLogRecGetInfo(buf->record) & ~XLR_INFO_MASK;
+
+	ReorderBufferProcessXid(ctx->reorder, XLogRecGetXid(buf->record), buf->origptr);
+
+	switch (info)
+	{
+		case XLOG2_CHECKSUMS:
+			break;
+		default:
+			elog(ERROR, "unexpected RM_XLOG2_ID record type: %u", info);
 	}
 }
 
@@ -365,6 +382,11 @@ standby_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			{
 				xl_running_xacts *running = (xl_running_xacts *) XLogRecGetData(r);
 
+				/*
+				 * Update this decoder's idea of transactions currently
+				 * running.  In doing so we will determine whether we have
+				 * reached consistent status.
+				 */
 				SnapBuildProcessRunningXacts(builder, buf->origptr, running);
 
 				/*
@@ -420,7 +442,8 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	{
 		case XLOG_HEAP2_MULTI_INSERT:
 			if (SnapBuildProcessChange(builder, xid, buf->origptr) &&
-				!ctx->fast_forward)
+				!ctx->fast_forward &&
+				!change_useless_for_repack(buf))
 				DecodeMultiInsert(ctx, buf);
 			break;
 		case XLOG_HEAP2_NEW_CID:
@@ -430,9 +453,8 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 				xlrec = (xl_heap_new_cid *) XLogRecGetData(buf->record);
 				SnapBuildProcessNewCid(builder, xid, buf->origptr, xlrec);
-
-				break;
 			}
+			break;
 		case XLOG_HEAP2_REWRITE:
 
 			/*
@@ -449,7 +471,6 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		case XLOG_HEAP2_PRUNE_ON_ACCESS:
 		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
 		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
-		case XLOG_HEAP2_VISIBLE:
 		case XLOG_HEAP2_LOCK_UPDATED:
 			break;
 		default:
@@ -484,7 +505,8 @@ heap_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	{
 		case XLOG_HEAP_INSERT:
 			if (SnapBuildProcessChange(builder, xid, buf->origptr) &&
-				!ctx->fast_forward)
+				!ctx->fast_forward &&
+				!change_useless_for_repack(buf))
 				DecodeInsert(ctx, buf);
 			break;
 
@@ -496,19 +518,22 @@ heap_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		case XLOG_HEAP_HOT_UPDATE:
 		case XLOG_HEAP_UPDATE:
 			if (SnapBuildProcessChange(builder, xid, buf->origptr) &&
-				!ctx->fast_forward)
+				!ctx->fast_forward &&
+				!change_useless_for_repack(buf))
 				DecodeUpdate(ctx, buf);
 			break;
 
 		case XLOG_HEAP_DELETE:
 			if (SnapBuildProcessChange(builder, xid, buf->origptr) &&
-				!ctx->fast_forward)
+				!ctx->fast_forward &&
+				!change_useless_for_repack(buf))
 				DecodeDelete(ctx, buf);
 			break;
 
 		case XLOG_HEAP_TRUNCATE:
 			if (SnapBuildProcessChange(builder, xid, buf->origptr) &&
-				!ctx->fast_forward)
+				!ctx->fast_forward &&
+				!change_useless_for_repack(buf))
 				DecodeTruncate(ctx, buf);
 			break;
 
@@ -524,7 +549,8 @@ heap_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 		case XLOG_HEAP_CONFIRM:
 			if (SnapBuildProcessChange(builder, xid, buf->origptr) &&
-				!ctx->fast_forward)
+				!ctx->fast_forward &&
+				!change_useless_for_repack(buf))
 				DecodeSpecConfirm(ctx, buf);
 			break;
 
@@ -1020,6 +1046,15 @@ DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	RelFileLocator target_locator;
 
 	xlrec = (xl_heap_delete *) XLogRecGetData(r);
+
+	/*
+	 * Skip changes that were marked as ignorable at origin.
+	 *
+	 * (This is used for changes that affect relations not visible to other
+	 * transactions, such as the transient table during concurrent repack.)
+	 */
+	if (xlrec->flags & XLH_DELETE_NO_LOGICAL)
+		return;
 
 	/* only interested in our database */
 	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);

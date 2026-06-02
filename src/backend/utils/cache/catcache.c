@@ -205,6 +205,10 @@ nameeqfast(Datum a, Datum b)
 	char	   *ca = NameStr(*DatumGetName(a));
 	char	   *cb = NameStr(*DatumGetName(b));
 
+	/*
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use fast path.
+	 */
 	return strncmp(ca, cb, NAMEDATALEN) == 0;
 }
 
@@ -213,6 +217,10 @@ namehashfast(Datum datum)
 {
 	char	   *key = NameStr(*DatumGetName(datum));
 
+	/*
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use fast path.
+	 */
 	return hash_bytes((unsigned char *) key, strlen(key));
 }
 
@@ -244,17 +252,20 @@ static bool
 texteqfast(Datum a, Datum b)
 {
 	/*
-	 * The use of DEFAULT_COLLATION_OID is fairly arbitrary here.  We just
-	 * want to take the fast "deterministic" path in texteq().
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use "C" locale for efficiency.
 	 */
-	return DatumGetBool(DirectFunctionCall2Coll(texteq, DEFAULT_COLLATION_OID, a, b));
+	return DatumGetBool(DirectFunctionCall2Coll(texteq, C_COLLATION_OID, a, b));
 }
 
 static uint32
 texthashfast(Datum datum)
 {
-	/* analogously here as in texteqfast() */
-	return DatumGetInt32(DirectFunctionCall1Coll(hashtext, DEFAULT_COLLATION_OID, datum));
+	/*
+	 * Catalogs only use deterministic collations, so ignore column collation
+	 * and use "C" locale for efficiency.
+	 */
+	return DatumGetInt32(DirectFunctionCall1Coll(hashtext, C_COLLATION_OID, datum));
 }
 
 static bool
@@ -2221,20 +2232,18 @@ CatalogCacheCreateEntry(CatCache *cache, HeapTuple ntp, Datum *arguments,
 			dtp = ntp;
 
 		/* Allocate memory for CatCTup and the cached tuple in one go */
-		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
-
-		ct = (CatCTup *) palloc(sizeof(CatCTup) +
-								MAXIMUM_ALIGNOF + dtp->t_len);
+		ct = (CatCTup *)
+			MemoryContextAlloc(CacheMemoryContext,
+							   MAXALIGN(sizeof(CatCTup)) + dtp->t_len);
 		ct->tuple.t_len = dtp->t_len;
 		ct->tuple.t_self = dtp->t_self;
 		ct->tuple.t_tableOid = dtp->t_tableOid;
 		ct->tuple.t_data = (HeapTupleHeader)
-			MAXALIGN(((char *) ct) + sizeof(CatCTup));
+			(((char *) ct) + MAXALIGN(sizeof(CatCTup)));
 		/* copy tuple contents */
 		memcpy((char *) ct->tuple.t_data,
 			   (const char *) dtp->t_data,
 			   dtp->t_len);
-		MemoryContextSwitchTo(oldcxt);
 
 		if (dtp != ntp)
 			heap_freetuple(dtp);

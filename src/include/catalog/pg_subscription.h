@@ -40,6 +40,8 @@
  * here, be sure to update that (or, if the new column is not to be publicly
  * readable, update associated comments and catalogs.sgml instead).
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID(6101,SubscriptionRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	Oid			oid;			/* oid */
@@ -90,9 +92,12 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 									 * exceeded max_retention_duration, when
 									 * defined */
 
+	Oid			subserver BKI_LOOKUP_OPT(pg_foreign_server);	/* If connection uses
+																 * server */
+
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* Connection string to the publisher */
-	text		subconninfo BKI_FORCE_NOT_NULL;
+	text		subconninfo;	/* Set if connecting with connection string */
 
 	/* Slot name on publisher */
 	NameData	subslotname BKI_FORCE_NULL;
@@ -111,6 +116,8 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 #endif
 } FormData_pg_subscription;
 
+END_CATALOG_STRUCT
+
 typedef FormData_pg_subscription *Form_pg_subscription;
 
 DECLARE_TOAST_WITH_MACRO(pg_subscription, 4183, 4184, PgSubscriptionToastTable, PgSubscriptionToastIndex);
@@ -123,6 +130,8 @@ MAKE_SYSCACHE(SUBSCRIPTIONNAME, pg_subscription_subname_index, 4);
 
 typedef struct Subscription
 {
+	MemoryContext cxt;			/* mem cxt containing this subscription */
+
 	Oid			oid;			/* Oid of the subscription */
 	Oid			dbid;			/* Oid of the database which subscription is
 								 * in */
@@ -203,8 +212,8 @@ typedef struct Subscription
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 
-extern Subscription *GetSubscription(Oid subid, bool missing_ok);
-extern void FreeSubscription(Subscription *sub);
+extern Subscription *GetSubscription(Oid subid, bool missing_ok,
+									 bool aclcheck);
 extern void DisableSubscription(Oid subid);
 
 extern int	CountDBSubscriptions(Oid dbid);

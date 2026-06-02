@@ -864,7 +864,7 @@ heap_entry_is_visible(BtreeCheckState *state, ItemPointer tid)
 }
 
 /*
- * Prepare an error message for unique constrain violation in
+ * Prepare an error message for unique constraint violation in
  * a btree index and report ERROR.
  */
 static void
@@ -3009,7 +3009,6 @@ static bool
 bt_rootdescend(BtreeCheckState *state, IndexTuple itup)
 {
 	BTScanInsert key;
-	BTStack		stack;
 	Buffer		lbuf;
 	bool		exists;
 
@@ -3026,7 +3025,7 @@ bt_rootdescend(BtreeCheckState *state, IndexTuple itup)
 	 */
 	Assert(state->readonly && state->rootdescend);
 	exists = false;
-	stack = _bt_search(state->rel, NULL, key, &lbuf, BT_READ);
+	_bt_search(state->rel, NULL, key, &lbuf, BT_READ, false);
 
 	if (BufferIsValid(lbuf))
 	{
@@ -3053,7 +3052,6 @@ bt_rootdescend(BtreeCheckState *state, IndexTuple itup)
 		_bt_relbuf(state->rel, lbuf);
 	}
 
-	_bt_freestack(stack);
 	pfree(key);
 
 	return exists;

@@ -25,6 +25,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(gist_page_opaque_info);
 PG_FUNCTION_INFO_V1(gist_page_items);
@@ -176,7 +177,7 @@ gist_page_items_bytea(PG_FUNCTION_ARGS)
 
 		memset(nulls, 0, sizeof(nulls));
 
-		values[0] = UInt16GetDatum(offset);
+		values[0] = Int16GetDatum(offset);
 		values[1] = ItemPointerGetDatum(&itup->t_tid);
 		values[2] = Int32GetDatum((int) IndexTupleSize(itup));
 
@@ -202,7 +203,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Page		page;
 	uint16		flagbits;
-	bits16		printflags = 0;
+	uint16		printflags = 0;
 	OffsetNumber offset;
 	OffsetNumber maxoff = InvalidOffsetNumber;
 	char	   *index_columns;
@@ -283,7 +284,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 
 		memset(nulls, 0, sizeof(nulls));
 
-		values[0] = UInt16GetDatum(offset);
+		values[0] = Int16GetDatum(offset);
 		values[1] = ItemPointerGetDatum(&itup->t_tid);
 		values[2] = Int32GetDatum((int) IndexTupleSize(itup));
 		values[3] = BoolGetDatum(ItemIdIsDead(id));
