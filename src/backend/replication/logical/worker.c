@@ -247,9 +247,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/genam.h"
 #include "access/commit_ts.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
@@ -266,6 +268,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/walwriter.h"
@@ -281,6 +284,7 @@
 #include "rewrite/rewriteHandler.h"
 #include "storage/buffile.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
@@ -295,6 +299,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/usercontext.h"
+#include "utils/wait_event.h"
 
 #define NAPTIME_PER_CYCLE 1000	/* max sleep time between cycles (1s) */
 
@@ -976,8 +981,8 @@ slot_fill_defaults(LogicalRepRelMapEntry *rel, EState *estate,
 	if (num_phys_attrs == rel->remoterel.natts)
 		return;
 
-	defmap = (int *) palloc(num_phys_attrs * sizeof(int));
-	defexprs = (ExprState **) palloc(num_phys_attrs * sizeof(ExprState *));
+	defmap = palloc_array(int, num_phys_attrs);
+	defexprs = palloc_array(ExprState *, num_phys_attrs);
 
 	Assert(rel->attrmap->maplen == num_phys_attrs);
 	for (attnum = 0; attnum < num_phys_attrs; attnum++)
@@ -1033,9 +1038,15 @@ slot_store_data(TupleTableSlot *slot, LogicalRepRelMapEntry *rel,
 
 		if (!att->attisdropped && remoteattnum >= 0)
 		{
-			StringInfo	colvalue = &tupleData->colvalues[remoteattnum];
+			StringInfo	colvalue;
 
-			Assert(remoteattnum < tupleData->ncols);
+			if (remoteattnum >= tupleData->ncols)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("logical replication column %d not found in tuple: only %d column(s) received",
+								remoteattnum + 1, tupleData->ncols)));
+
+			colvalue = &tupleData->colvalues[remoteattnum];
 
 			/* Set attnum for error callback */
 			apply_error_callback_arg.remote_attnum = remoteattnum;
@@ -1146,7 +1157,11 @@ slot_modify_data(TupleTableSlot *slot, TupleTableSlot *srcslot,
 		if (remoteattnum < 0)
 			continue;
 
-		Assert(remoteattnum < tupleData->ncols);
+		if (remoteattnum >= tupleData->ncols)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("logical replication column %d not found in tuple: only %d column(s) received",
+							remoteattnum + 1, tupleData->ncols)));
 
 		if (tupleData->colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED)
 		{
@@ -2865,7 +2880,12 @@ apply_handle_update(StringInfo s)
 
 		if (!att->attisdropped && remoteattnum >= 0)
 		{
-			Assert(remoteattnum < newtup.ncols);
+			if (remoteattnum >= newtup.ncols)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("logical replication column %d not found in tuple: only %d column(s) received",
+								remoteattnum + 1, newtup.ncols)));
+
 			if (newtup.colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED)
 				target_perminfo->updatedCols =
 					bms_add_member(target_perminfo->updatedCols,
@@ -4975,7 +4995,7 @@ adjust_xid_advance_interval(RetainDeadTuplesData *rdt_data, bool new_xid_found)
 		/*
 		 * Retention has been stopped, so double the interval-capped at a
 		 * maximum of 3 minutes. The wal_receiver_status_interval is
-		 * intentionally not used as a upper bound, since the likelihood of
+		 * intentionally not used as an upper bound, since the likelihood of
 		 * retention resuming is lower than that of general activity resuming.
 		 */
 		rdt_data->xid_advance_interval = Min(rdt_data->xid_advance_interval * 2,
@@ -4992,9 +5012,10 @@ adjust_xid_advance_interval(RetainDeadTuplesData *rdt_data, bool new_xid_found)
 
 	/*
 	 * Ensure the wait time remains within the maximum retention time limit
-	 * when retention is active.
+	 * when retention is active.  Skip this cap when maxretention is zero,
+	 * which means unlimited retention (no timeout).
 	 */
-	if (MySubscription->retentionactive)
+	if (MySubscription->retentionactive && MySubscription->maxretention > 0)
 		rdt_data->xid_advance_interval = Min(rdt_data->xid_advance_interval,
 											 MySubscription->maxretention);
 }
@@ -5039,7 +5060,6 @@ apply_worker_exit(void)
 void
 maybe_reread_subscription(void)
 {
-	MemoryContext oldctx;
 	Subscription *newsub;
 	bool		started_tx = false;
 
@@ -5054,17 +5074,18 @@ maybe_reread_subscription(void)
 		started_tx = true;
 	}
 
-	/* Ensure allocations in permanent context. */
-	oldctx = MemoryContextSwitchTo(ApplyContext);
+	newsub = GetSubscription(MyLogicalRepWorker->subid, true, true);
 
-	newsub = GetSubscription(MyLogicalRepWorker->subid, true);
-
-	/*
-	 * Exit if the subscription was removed. This normally should not happen
-	 * as the worker gets killed during DROP SUBSCRIPTION.
-	 */
-	if (!newsub)
+	if (newsub)
 	{
+		MemoryContextSetParent(newsub->cxt, ApplyContext);
+	}
+	else
+	{
+		/*
+		 * Exit if the subscription was removed. This normally should not
+		 * happen as the worker gets killed during DROP SUBSCRIPTION.
+		 */
 		ereport(LOG,
 				(errmsg("logical replication worker for subscription \"%s\" will stop because the subscription was removed",
 						MySubscription->name)));
@@ -5147,10 +5168,8 @@ maybe_reread_subscription(void)
 	}
 
 	/* Clean old subscription info and switch to new one. */
-	FreeSubscription(MySubscription);
+	MemoryContextDelete(MySubscription->cxt);
 	MySubscription = newsub;
-
-	MemoryContextSwitchTo(oldctx);
 
 	/* Change synchronous commit according to the user's wishes */
 	SetConfigOption("synchronous_commit", MySubscription->synccommit,
@@ -5199,7 +5218,9 @@ set_wal_receiver_timeout(void)
 }
 
 /*
- * Callback from subscription syscache invalidation.
+ * Callback from subscription syscache invalidation. Also needed for server or
+ * user mapping invalidation, which can change the connection information for
+ * subscriptions that connect using a server object.
  */
 static void
 subscription_change_cb(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
@@ -5302,8 +5323,8 @@ subxact_info_read(Oid subid, TransactionId xid)
 	 * to the subxact file and reset the logical streaming context.
 	 */
 	oldctx = MemoryContextSwitchTo(LogicalStreamingContext);
-	subxact_data.subxacts = palloc(subxact_data.nsubxacts_max *
-								   sizeof(SubXactInfo));
+	subxact_data.subxacts = palloc_array(SubXactInfo,
+										 subxact_data.nsubxacts_max);
 	MemoryContextSwitchTo(oldctx);
 
 	if (len > 0)
@@ -5369,14 +5390,14 @@ subxact_info_add(TransactionId xid)
 		 * subxact_info_read.
 		 */
 		oldctx = MemoryContextSwitchTo(LogicalStreamingContext);
-		subxacts = palloc(subxact_data.nsubxacts_max * sizeof(SubXactInfo));
+		subxacts = palloc_array(SubXactInfo, subxact_data.nsubxacts_max);
 		MemoryContextSwitchTo(oldctx);
 	}
 	else if (subxact_data.nsubxacts == subxact_data.nsubxacts_max)
 	{
 		subxact_data.nsubxacts_max *= 2;
-		subxacts = repalloc(subxacts,
-							subxact_data.nsubxacts_max * sizeof(SubXactInfo));
+		subxacts = repalloc_array(subxacts, SubXactInfo,
+								  subxact_data.nsubxacts_max);
 	}
 
 	subxacts[subxact_data.nsubxacts].xid = xid;
@@ -5773,8 +5794,6 @@ run_apply_worker(void)
 void
 InitializeLogRepWorker(void)
 {
-	MemoryContext oldctx;
-
 	/* Run as replica session replication role. */
 	SetConfigOption("session_replication_role", "replica",
 					PGC_SUSET, PGC_S_OVERRIDE);
@@ -5790,12 +5809,11 @@ InitializeLogRepWorker(void)
 	 */
 	SetConfigOption("search_path", "", PGC_SUSET, PGC_S_OVERRIDE);
 
-	/* Load the subscription into persistent memory context. */
 	ApplyContext = AllocSetContextCreate(TopMemoryContext,
 										 "ApplyContext",
 										 ALLOCSET_DEFAULT_SIZES);
+
 	StartTransactionCommand();
-	oldctx = MemoryContextSwitchTo(ApplyContext);
 
 	/*
 	 * Lock the subscription to prevent it from being concurrently dropped,
@@ -5804,8 +5822,14 @@ InitializeLogRepWorker(void)
 	 */
 	LockSharedObject(SubscriptionRelationId, MyLogicalRepWorker->subid, 0,
 					 AccessShareLock);
-	MySubscription = GetSubscription(MyLogicalRepWorker->subid, true);
-	if (!MySubscription)
+
+	MySubscription = GetSubscription(MyLogicalRepWorker->subid, true, true);
+
+	if (MySubscription)
+	{
+		MemoryContextSetParent(MySubscription->cxt, ApplyContext);
+	}
+	else
 	{
 		ereport(LOG,
 				(errmsg("logical replication worker for subscription %u will not start because the subscription was removed during startup",
@@ -5819,7 +5843,6 @@ InitializeLogRepWorker(void)
 	}
 
 	MySubscriptionValid = true;
-	MemoryContextSwitchTo(oldctx);
 
 	if (!MySubscription->enabled)
 	{
@@ -5867,6 +5890,22 @@ InitializeLogRepWorker(void)
 	 * role's superuser privilege can be revoked.
 	 */
 	CacheRegisterSyscacheCallback(SUBSCRIPTIONOID,
+								  subscription_change_cb,
+								  (Datum) 0);
+	/* Changes to foreign servers may affect subscriptions using SERVER. */
+	CacheRegisterSyscacheCallback(FOREIGNSERVEROID,
+								  subscription_change_cb,
+								  (Datum) 0);
+	/* Changes to user mappings may affect subscriptions using SERVER. */
+	CacheRegisterSyscacheCallback(USERMAPPINGOID,
+								  subscription_change_cb,
+								  (Datum) 0);
+
+	/*
+	 * Changes to FDW connection_function may affect subscriptions using
+	 * SERVER.
+	 */
+	CacheRegisterSyscacheCallback(FOREIGNDATAWRAPPEROID,
 								  subscription_change_cb,
 								  (Datum) 0);
 

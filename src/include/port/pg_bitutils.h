@@ -277,7 +277,7 @@ pg_ceil_log2_64(uint64 num)
 }
 
 extern uint64 pg_popcount_portable(const char *buf, int bytes);
-extern uint64 pg_popcount_masked_portable(const char *buf, int bytes, bits8 mask);
+extern uint64 pg_popcount_masked_portable(const char *buf, int bytes, uint8 mask);
 
 #if defined(HAVE_X86_64_POPCNTQ) || defined(USE_SVE_POPCNT_WITH_RUNTIME_CHECK)
 /*
@@ -285,63 +285,53 @@ extern uint64 pg_popcount_masked_portable(const char *buf, int bytes, bits8 mask
  * first.
  */
 extern PGDLLIMPORT uint64 (*pg_popcount_optimized) (const char *buf, int bytes);
-extern PGDLLIMPORT uint64 (*pg_popcount_masked_optimized) (const char *buf, int bytes, bits8 mask);
+extern PGDLLIMPORT uint64 (*pg_popcount_masked_optimized) (const char *buf, int bytes, uint8 mask);
 
 #else
 /* Use a portable implementation -- no need for a function pointer. */
 extern uint64 pg_popcount_optimized(const char *buf, int bytes);
-extern uint64 pg_popcount_masked_optimized(const char *buf, int bytes, bits8 mask);
+extern uint64 pg_popcount_masked_optimized(const char *buf, int bytes, uint8 mask);
 
 #endif
 
 /*
  * pg_popcount32
  *		Return the number of 1 bits set in word
+ *
+ * Adapted from
+ * https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel.
+ *
+ * Note that newer versions of popular compilers will automatically replace
+ * this with a special popcount instruction if possible, so we don't bother
+ * using builtin functions or intrinsics.
  */
 static inline int
 pg_popcount32(uint32 word)
 {
-#ifdef HAVE__BUILTIN_POPCOUNT
-	return __builtin_popcount(word);
-#else							/* !HAVE__BUILTIN_POPCOUNT */
-	int			result = 0;
-
-	while (word != 0)
-	{
-		result += pg_number_of_ones[word & 255];
-		word >>= 8;
-	}
-
-	return result;
-#endif							/* HAVE__BUILTIN_POPCOUNT */
+	word -= (word >> 1) & 0x55555555;
+	word = (word & 0x33333333) + ((word >> 2) & 0x33333333);
+	return (((word + (word >> 4)) & 0xf0f0f0f) * 0x1010101) >> 24;
 }
 
 /*
  * pg_popcount64
  *		Return the number of 1 bits set in word
+ *
+ * Adapted from
+ * https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel.
+ *
+ * Note that newer versions of popular compilers will automatically replace
+ * this with a special popcount instruction if possible, so we don't bother
+ * using builtin functions or intrinsics.
  */
 static inline int
 pg_popcount64(uint64 word)
 {
-#ifdef HAVE__BUILTIN_POPCOUNT
-#if SIZEOF_LONG == 8
-	return __builtin_popcountl(word);
-#elif SIZEOF_LONG_LONG == 8
-	return __builtin_popcountll(word);
-#else
-#error "cannot find integer of the same size as uint64_t"
-#endif
-#else							/* !HAVE__BUILTIN_POPCOUNT */
-	int			result = 0;
-
-	while (word != 0)
-	{
-		result += pg_number_of_ones[word & 255];
-		word >>= 8;
-	}
-
-	return result;
-#endif							/* HAVE__BUILTIN_POPCOUNT */
+	word -= (word >> 1) & UINT64CONST(0x5555555555555555);
+	word = (word & UINT64CONST(0x3333333333333333)) +
+		((word >> 2) & UINT64CONST(0x3333333333333333));
+	word = (word + (word >> 4)) & UINT64CONST(0xf0f0f0f0f0f0f0f);
+	return (word * UINT64CONST(0x101010101010101)) >> 56;
 }
 
 /*
@@ -379,7 +369,7 @@ pg_popcount(const char *buf, int bytes)
  * it's likely to be faster.
  */
 static inline uint64
-pg_popcount_masked(const char *buf, int bytes, bits8 mask)
+pg_popcount_masked(const char *buf, int bytes, uint8 mask)
 {
 	/*
 	 * We set the threshold to the point at which we'll first use special

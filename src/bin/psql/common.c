@@ -328,7 +328,8 @@ psql_setup_cancel_handler(void)
 }
 
 
-/* ConnectionUp
+/*
+ * ConnectionUp
  *
  * Returns whether our backend connection is still there.
  */
@@ -340,7 +341,8 @@ ConnectionUp(void)
 
 
 
-/* CheckConnection
+/*
+ * CheckConnection
  *
  * Verify that we still have a good connection to the backend, and if not,
  * see if it can be restored.
@@ -664,14 +666,14 @@ PSQLexec(const char *query)
 
 	if (pset.echo_hidden != PSQL_ECHO_HIDDEN_OFF)
 	{
-		printf(_("/******** QUERY *********/\n"
+		printf(_("/**** INTERNAL QUERY ****/\n"
 				 "%s\n"
 				 "/************************/\n\n"), query);
 		fflush(stdout);
 		if (pset.logfile)
 		{
 			fprintf(pset.logfile,
-					_("/******** QUERY *********/\n"
+					_("/**** INTERNAL QUERY ****/\n"
 					  "%s\n"
 					  "/************************/\n\n"), query);
 			fflush(pset.logfile);
@@ -2567,7 +2569,8 @@ get_conninfo_value(const char *keyword)
 	return res;
 }
 
-/* expand_tilde
+/*
+ * expand_tilde
  *
  * substitute '~' with HOME or '~username' with username's home dir
  *

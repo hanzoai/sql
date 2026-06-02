@@ -45,11 +45,19 @@ tests += {
     'specs': [
       'basic',
       'inplace',
+      'repack',
+      'repack_temporal',
+      'repack_temporal_multirange',
+      'repack_toast',
       'syscache-update-pruned',
       'heap_lock_update',
     ],
     'runningcheck': false, # see syscache-update-pruned
     # Some tests wait for all snapshots, so avoid parallel execution
     'runningcheck-parallel': false,
+    # some tests require wal_level=replica
+    'regress_args': [
+      '--temp-config', files('extra.conf'),
+    ],
   },
 }
