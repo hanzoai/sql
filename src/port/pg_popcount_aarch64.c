@@ -35,7 +35,7 @@
  * versions.
  */
 static uint64 pg_popcount_neon(const char *buf, int bytes);
-static uint64 pg_popcount_masked_neon(const char *buf, int bytes, bits8 mask);
+static uint64 pg_popcount_masked_neon(const char *buf, int bytes, uint8 mask);
 
 #ifdef USE_SVE_POPCNT_WITH_RUNTIME_CHECK
 
@@ -43,7 +43,7 @@ static uint64 pg_popcount_masked_neon(const char *buf, int bytes, bits8 mask);
  * These are the SVE implementations of the popcount functions.
  */
 static uint64 pg_popcount_sve(const char *buf, int bytes);
-static uint64 pg_popcount_masked_sve(const char *buf, int bytes, bits8 mask);
+static uint64 pg_popcount_masked_sve(const char *buf, int bytes, uint8 mask);
 
 /*
  * The function pointers are initially set to "choose" functions.  These
@@ -52,9 +52,9 @@ static uint64 pg_popcount_masked_sve(const char *buf, int bytes, bits8 mask);
  * caller's request.
  */
 static uint64 pg_popcount_choose(const char *buf, int bytes);
-static uint64 pg_popcount_masked_choose(const char *buf, int bytes, bits8 mask);
+static uint64 pg_popcount_masked_choose(const char *buf, int bytes, uint8 mask);
 uint64		(*pg_popcount_optimized) (const char *buf, int bytes) = pg_popcount_choose;
-uint64		(*pg_popcount_masked_optimized) (const char *buf, int bytes, bits8 mask) = pg_popcount_masked_choose;
+uint64		(*pg_popcount_masked_optimized) (const char *buf, int bytes, uint8 mask) = pg_popcount_masked_choose;
 
 static inline bool
 pg_popcount_sve_available(void)
@@ -94,7 +94,7 @@ pg_popcount_choose(const char *buf, int bytes)
 }
 
 static uint64
-pg_popcount_masked_choose(const char *buf, int bytes, bits8 mask)
+pg_popcount_masked_choose(const char *buf, int bytes, uint8 mask)
 {
 	choose_popcount_functions();
 	return pg_popcount_masked_optimized(buf, bytes, mask);
@@ -190,7 +190,7 @@ pg_popcount_sve(const char *buf, int bytes)
  */
 pg_attribute_target("arch=armv8-a+sve")
 static uint64
-pg_popcount_masked_sve(const char *buf, int bytes, bits8 mask)
+pg_popcount_masked_sve(const char *buf, int bytes, uint8 mask)
 {
 	svbool_t	pred = svptrue_b64();
 	svuint64_t	accum1 = svdup_u64(0),
@@ -284,7 +284,7 @@ pg_popcount_optimized(const char *buf, int bytes)
 }
 
 uint64
-pg_popcount_masked_optimized(const char *buf, int bytes, bits8 mask)
+pg_popcount_masked_optimized(const char *buf, int bytes, uint8 mask)
 {
 	return pg_popcount_masked_neon(buf, bytes, mask);
 }
@@ -298,11 +298,6 @@ pg_popcount_masked_optimized(const char *buf, int bytes, bits8 mask)
 static inline int
 pg_popcount64_neon(uint64 word)
 {
-	/*
-	 * For some compilers, __builtin_popcountl() already emits Neon
-	 * instructions.  The line below should compile to the same code on those
-	 * systems.
-	 */
 	return vaddv_u8(vcnt_u8(vld1_u8((const uint8 *) &word)));
 }
 
@@ -391,7 +386,7 @@ pg_popcount_neon(const char *buf, int bytes)
  *		Returns number of 1 bits in buf after applying the mask to each byte
  */
 static uint64
-pg_popcount_masked_neon(const char *buf, int bytes, bits8 mask)
+pg_popcount_masked_neon(const char *buf, int bytes, uint8 mask)
 {
 	uint8x16_t	vec,
 				maskv = vdupq_n_u8(mask);
@@ -468,4 +463,10 @@ pg_popcount_masked_neon(const char *buf, int bytes, bits8 mask)
 	return popcnt;
 }
 
-#endif							/* USE_NEON */
+#else							/* USE_NEON */
+
+/* prevent linker complaints about empty module */
+extern int	pg_popcount_aarch64_dummy_variable;
+int			pg_popcount_aarch64_dummy_variable = 0;
+
+#endif							/* ! USE_NEON */

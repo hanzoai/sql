@@ -1178,7 +1178,8 @@ pg_mbstrlen(const char *mbstr)
 	return len;
 }
 
-/* returns the length (counted in wchars) of a multibyte string
+/*
+ * returns the length (counted in wchars) of a multibyte string
  * (stops at the first of "limit" or a NUL)
  */
 int
@@ -1308,8 +1309,7 @@ SetMessageEncoding(int encoding)
 #ifdef ENABLE_NLS
 /*
  * Make one bind_textdomain_codeset() call, translating a pg_enc to a gettext
- * codeset.  Fails for MULE_INTERNAL, an encoding unknown to gettext; can also
- * fail for gettext-internal causes like out-of-memory.
+ * codeset.  Can fail for gettext-internal causes like out-of-memory.
  */
 static bool
 raw_pg_bind_textdomain_codeset(const char *domainname, int encoding)
@@ -1429,8 +1429,7 @@ PG_encoding_to_char(PG_FUNCTION_ARGS)
 /*
  * gettext() returns messages in this encoding.  This often matches the
  * database encoding, but it differs for SQL_ASCII databases, for processes
- * not attached to a database, and under a database encoding lacking iconv
- * support (MULE_INTERNAL).
+ * not attached to a database.
  */
 int
 GetMessageEncoding(void)
