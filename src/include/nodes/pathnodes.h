@@ -321,6 +321,18 @@ struct PlannerInfo
 	char	   *plan_name;
 
 	/*
+	 * If this PlannerInfo exists to consider an alternative implementation
+	 * strategy for a portion of the query that could also be implemented by
+	 * some other PlannerInfo, this is the plan_name for that other
+	 * PlannerInfo. When we are considering the first or only alternative, it
+	 * is the same as plan_name.
+	 *
+	 * Currently, we set this to a value other than plan_name only when
+	 * considering a MinMaxAggPath or a hashed SubPlan.
+	 */
+	char	   *alternative_plan_name;
+
+	/*
 	 * plan_params contains the expressions that this query level needs to
 	 * make available to a lower query level that is currently being planned.
 	 * outer_params contains the paramIds of PARAM_EXEC Params that outer
@@ -1412,6 +1424,8 @@ typedef struct IndexOptInfo
 	bool		nullsnotdistinct;
 	/* is uniqueness enforced immediately? */
 	bool		immediate;
+	/* true if paths using this index should be marked disabled */
+	bool		disabled;
 	/* true if index doesn't really exist */
 	bool		hypothetical;
 
@@ -2707,6 +2721,7 @@ typedef struct ModifyTablePath
 	List	   *returningLists; /* per-target-table RETURNING tlists */
 	List	   *rowMarks;		/* PlanRowMarks (non-locking only) */
 	OnConflictExpr *onconflict; /* ON CONFLICT clause, or NULL */
+	ForPortionOfExpr *forPortionOf; /* FOR PORTION OF clause for UPDATE/DELETE */
 	int			epqParam;		/* ID of Param for EvalPlanQual re-eval */
 	List	   *mergeActionLists;	/* per-target-table lists of actions for
 									 * MERGE */
@@ -3359,6 +3374,20 @@ typedef struct RowIdentityVarInfo
 	char	   *rowidname;		/* name of the resjunk column */
 	Relids		rowidrels;		/* RTE indexes of target rels using this */
 } RowIdentityVarInfo;
+
+/*
+ * One element of the list passed to query_is_distinct_for().  Each entry
+ * names a subquery output column that the caller needs to be distinct over,
+ * plus the upper-level equality operator and its input collation, so that
+ * the subquery's own DISTINCT/GROUP BY/set-op clauses can be compared for
+ * compatibility.
+ */
+typedef struct DistinctColInfo
+{
+	int			colno;			/* subquery output column resno */
+	Oid			opid;			/* upper-level equality operator */
+	Oid			collid;			/* input collation of opid */
+} DistinctColInfo;
 
 /*
  * For each distinct placeholder expression generated during planning, we

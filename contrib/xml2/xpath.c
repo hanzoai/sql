@@ -12,6 +12,7 @@
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
+#include "utils/tuplestore.h"
 #include "utils/xml.h"
 
 /* libxml includes */
@@ -231,7 +232,8 @@ pgxmlNodeSetToText(xmlNodeSetPtr nodeset,
 }
 
 
-/* Translate a PostgreSQL "varlena" -i.e. a variable length parameter
+/*
+ * Translate a PostgreSQL "varlena" -i.e. a variable length parameter
  * into the libxml2 representation
  */
 static xmlChar *

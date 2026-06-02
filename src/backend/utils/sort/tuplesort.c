@@ -104,6 +104,7 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "port/pg_bitutils.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -2588,7 +2589,7 @@ normalize_datum(Datum orig, SortSupport ssup)
 
 	if (ssup->comparator == ssup_datum_signed_cmp)
 	{
-		norm_datum1 = orig + ((uint64) PG_INT64_MAX) + 1;
+		norm_datum1 = orig + (Int64GetDatum(PG_INT64_MAX)) + 1;
 	}
 	else if (ssup->comparator == ssup_datum_int32_cmp)
 	{
@@ -2619,8 +2620,8 @@ normalize_datum(Datum orig, SortSupport ssup)
  * Radix sort by (pass-by-value) datum1, diverting to qsort_tuple()
  * for tiebreaks.
  *
- * This is a modification of
- * ska_byte_sort() from https://github.com/skarupke/ska_sort
+ * This is a modification of ska_byte_sort() from
+ * https://github.com/skarupke/ska_sort
  * The original copyright notice follows:
  *
  * Copyright Malte Skarupke 2016.
@@ -2659,17 +2660,25 @@ radix_sort_recursive(SortTuple *begin, size_t n_elems, int level, Tuplesortstate
 	int			num_partitions = 0;
 	int			num_remaining;
 	SortSupport ssup = &state->base.sortKeys[0];
+	Datum		ref_datum;
+	Datum		common_upper_bits = 0;
 	size_t		start_offset = 0;
 	SortTuple  *partition_begin = begin;
+	int			next_level;
 
 	/* count number of occurrences of each byte */
+	ref_datum = normalize_datum(begin[0].datum1, ssup);
 	for (SortTuple *st = begin; st < begin + n_elems; st++)
 	{
+		Datum		this_datum;
 		uint8		this_partition;
 
+		this_datum = normalize_datum(st->datum1, ssup);
+		/* accumulate bits different from the reference datum */
+		common_upper_bits |= ref_datum ^ this_datum;
+
 		/* extract the byte for this level from the normalized datum */
-		this_partition = current_byte(normalize_datum(st->datum1, ssup),
-									  level);
+		this_partition = current_byte(this_datum, level);
 
 		/* save it for the permutation step */
 		st->curbyte = this_partition;
@@ -2747,6 +2756,35 @@ radix_sort_recursive(SortTuple *begin, size_t n_elems, int level, Tuplesortstate
 	}
 
 	/* recurse */
+
+	if (num_partitions == 1)
+	{
+		/*
+		 * There is only one distinct byte at the current level. It can happen
+		 * that some subsequent bytes are also the same for all input values,
+		 * such as the upper bytes of small integers. To skip unproductive
+		 * passes for that case, we compute the level where the input has more
+		 * than one distinct byte, so that the next recursion can start there.
+		 */
+		if (common_upper_bits == 0)
+			next_level = sizeof(Datum);
+		else
+		{
+			int			diffpos;
+
+			/*
+			 * The upper bits of common_upper_bits are zero where all datums
+			 * have the same bits.
+			 */
+			diffpos = pg_leftmost_one_pos64(DatumGetUInt64(common_upper_bits));
+			next_level = sizeof(Datum) - 1 - (diffpos / BITS_PER_BYTE);
+		}
+	}
+	else
+		next_level = level + 1;
+
+	Assert(next_level > level);
+
 	for (uint8 *rp = remaining_partitions;
 		 rp < remaining_partitions + num_partitions;
 		 rp++)
@@ -2757,7 +2795,7 @@ radix_sort_recursive(SortTuple *begin, size_t n_elems, int level, Tuplesortstate
 
 		if (num_elements > 1)
 		{
-			if (level < sizeof(Datum) - 1)
+			if (next_level < sizeof(Datum))
 			{
 				if (num_elements < QSORT_THRESHOLD)
 				{
@@ -2770,7 +2808,7 @@ radix_sort_recursive(SortTuple *begin, size_t n_elems, int level, Tuplesortstate
 				{
 					radix_sort_recursive(partition_begin,
 										 num_elements,
-										 level + 1,
+										 next_level,
 										 state);
 				}
 			}
@@ -2813,7 +2851,8 @@ radix_sort_tuple(SortTuple *data, size_t n, Tuplesortstate *state)
 	/*
 	 * Find the first NOT NULL if NULLS FIRST, or first NULL if NULLS LAST.
 	 * This also serves as a quick check for the common case where all tuples
-	 * are NOT NULL in the first sort key.
+	 * are NOT NULL in the first sort key with the default order ASC NULLS
+	 * LAST.
 	 */
 	while (d1 < n && data[d1].isnull1 == nulls_first)
 	{

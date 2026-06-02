@@ -69,6 +69,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 #include "utils/varlena.h"
 
 
@@ -512,6 +513,7 @@ is_extension_script_filename(const char *filename)
 static List *
 get_extension_control_directories(void)
 {
+#define EXTENSION_SYSTEM_MACRO  "$system"
 	char		sharepath[MAXPGPATH];
 	char	   *system_dir;
 	char	   *ecp;
@@ -525,7 +527,7 @@ get_extension_control_directories(void)
 	{
 		ExtensionLocation *location = palloc_object(ExtensionLocation);
 
-		location->macro = NULL;
+		location->macro = pstrdup(EXTENSION_SYSTEM_MACRO);
 		location->loc = system_dir;
 		paths = lappend(paths, location);
 	}
@@ -555,10 +557,10 @@ get_extension_control_directories(void)
 			 * Substitute the path macro if needed or append "extension"
 			 * suffix if it is a custom extension control path.
 			 */
-			if (strcmp(piece, "$system") == 0)
+			if (strcmp(piece, EXTENSION_SYSTEM_MACRO) == 0)
 			{
 				location->macro = pstrdup(piece);
-				mangled = substitute_path_macro(piece, "$system", system_dir);
+				mangled = substitute_path_macro(piece, EXTENSION_SYSTEM_MACRO, system_dir);
 			}
 			else
 			{
@@ -581,6 +583,7 @@ get_extension_control_directories(void)
 	}
 
 	return paths;
+#undef EXTENSION_SYSTEM_MACRO
 }
 
 /*
@@ -1951,14 +1954,17 @@ CreateExtensionInternal(char *extensionName,
 
 		if (!OidIsValid(schemaOid))
 		{
+			ParseState *pstate = make_parsestate(NULL);
 			CreateSchemaStmt *csstmt = makeNode(CreateSchemaStmt);
+
+			pstate->p_sourcetext = "(generated CREATE SCHEMA command)";
 
 			csstmt->schemaname = schemaName;
 			csstmt->authrole = NULL;	/* will be created by current user */
 			csstmt->schemaElts = NIL;
 			csstmt->if_not_exists = false;
-			CreateSchemaCommand(csstmt, "(generated CREATE SCHEMA command)",
-								-1, -1);
+
+			CreateSchemaCommand(pstate, csstmt, -1, -1);
 
 			/*
 			 * CreateSchemaCommand includes CommandCounterIncrement, so new
@@ -2528,7 +2534,7 @@ pg_available_extension_versions(PG_FUNCTION_ARGS)
 
 				/*
 				 * Ignore already-found names.  They are not reachable by the
-				 * path search, so don't shown them.
+				 * path search, so don't show them.
 				 */
 				extname_str = makeString(extname);
 				if (list_member(found_ext, extname_str))

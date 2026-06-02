@@ -223,9 +223,12 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 
 	conn = palloc0_object(WalReceiverConn);
 	conn->streamConn =
-		libpqsrv_connect_params(keys, vals,
-								 /* expand_dbname = */ true,
-								WAIT_EVENT_LIBPQWALRECEIVER_CONNECT);
+		libpqsrv_connect_params_start(keys, vals,
+									   /* expand_dbname = */ true);
+	PQsetNoticeReceiver(conn->streamConn, libpqsrv_notice_receiver,
+						"received message via replication");
+	libpqsrv_connect_complete(conn->streamConn,
+							  WAIT_EVENT_LIBPQWALRECEIVER_CONNECT);
 
 	if (options_val != NULL)
 		pfree(options_val);
@@ -244,9 +247,6 @@ libpqrcv_connect(const char *conninfo, bool replication, bool logical,
 				 errdetail("Non-superuser cannot connect if the server does not request a password."),
 				 errhint("Target server's authentication method must be changed, or set password_required=false in the subscription parameters.")));
 	}
-
-	PQsetNoticeReceiver(conn->streamConn, libpqsrv_notice_receiver,
-						"received message via replication");
 
 	/*
 	 * Set always-secure search path for the cases where the connection is
@@ -1073,6 +1073,7 @@ libpqrcv_processTuples(PGresult *pgres, WalRcvExecResult *walres,
 	for (coln = 0; coln < nRetTypes; coln++)
 		TupleDescInitEntry(walres->tupledesc, (AttrNumber) coln + 1,
 						   PQfname(pgres, coln), retTypes[coln], -1, 0);
+	TupleDescFinalize(walres->tupledesc);
 	attinmeta = TupleDescGetAttInMetadata(walres->tupledesc);
 
 	/* No point in doing more here if there were no tuples returned. */

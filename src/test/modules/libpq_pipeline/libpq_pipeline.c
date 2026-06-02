@@ -24,7 +24,7 @@
 
 
 static void exit_nicely(PGconn *conn);
-pg_noreturn static void pg_fatal_impl(int line, const char *fmt,...)
+pg_noreturn static void pg_fatal_impl(int line, const char *fmt, ...)
 			pg_attribute_printf(2, 3);
 static bool process_result(PGconn *conn, PGresult *res, int results,
 						   int numsent);
@@ -72,7 +72,7 @@ exit_nicely(PGconn *conn)
  */
 #define pg_fatal(...) pg_fatal_impl(__LINE__, __VA_ARGS__)
 pg_noreturn static void
-pg_fatal_impl(int line, const char *fmt,...)
+pg_fatal_impl(int line, const char *fmt, ...)
 {
 	va_list		args;
 
@@ -260,8 +260,8 @@ copy_connection(PGconn *conn)
 		nopts++;
 	nopts++;					/* for the NULL terminator */
 
-	keywords = pg_malloc(sizeof(char *) * nopts);
-	vals = pg_malloc(sizeof(char *) * nopts);
+	keywords = pg_malloc_array(const char *, nopts);
+	vals = pg_malloc_array(const char *, nopts);
 
 	i = 0;
 	for (PQconninfoOption *opt = opts; opt->keyword != NULL; ++opt)
@@ -1337,8 +1337,8 @@ test_protocol_version(PGconn *conn)
 		nopts++;
 	nopts++;					/* NULL terminator */
 
-	keywords = pg_malloc0(sizeof(char *) * nopts);
-	vals = pg_malloc0(sizeof(char *) * nopts);
+	keywords = pg_malloc0_array(const char *, nopts);
+	vals = pg_malloc0_array(const char *, nopts);
 
 	i = 0;
 	for (PQconninfoOption *opt = opts; opt->keyword != NULL; ++opt)
@@ -1363,7 +1363,7 @@ test_protocol_version(PGconn *conn)
 	Assert(max_protocol_version_index >= 0);
 
 	/*
-	 * Test default protocol_version
+	 * Test default protocol_version (GREASE - should negotiate down to 3.2)
 	 */
 	vals[max_protocol_version_index] = "";
 	conn = PQconnectdbParams(keywords, vals, false);
@@ -1373,8 +1373,8 @@ test_protocol_version(PGconn *conn)
 				 PQerrorMessage(conn));
 
 	protocol_version = PQfullProtocolVersion(conn);
-	if (protocol_version != 30000)
-		pg_fatal("expected 30000, got %d", protocol_version);
+	if (protocol_version != 30002)
+		pg_fatal("expected 30002, got %d", protocol_version);
 
 	PQfinish(conn);
 

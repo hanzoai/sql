@@ -72,6 +72,7 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "utils/wait_event.h"
 
 /*
  *	User-tweakable parameters
@@ -1043,6 +1044,34 @@ bool
 TransactionStartedDuringRecovery(void)
 {
 	return CurrentTransactionState->startedInRecovery;
+}
+
+/*
+ *	GetTopReadOnlyTransactionNestLevel
+ *
+ * Note: this will return zero when not inside any transaction or when neither
+ * a top-level transaction nor subtransactions are read-only, one when the
+ * top-level transaction is read-only, two when one level of subtransaction is
+ * read-only, etc.
+ *
+ * Note: subtransactions of the topmost read-only transaction are also
+ * read-only, because they inherit read-only mode from the transaction, and
+ * thus can't change to read-write mode (see check_transaction_read_only).
+ */
+int
+GetTopReadOnlyTransactionNestLevel(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (!XactReadOnly)
+		return 0;
+	while (s->nestingLevel > 1)
+	{
+		if (!s->prevXactReadOnly)
+			return s->nestingLevel;
+		s = s->parent;
+	}
+	return s->nestingLevel;
 }
 
 /*
@@ -5259,6 +5288,11 @@ AbortSubTransaction(void)
 	 * Buffer locks, for example?  I don't think so but I'm not sure.
 	 */
 	LWLockReleaseAll();
+
+	/*
+	 * Cleanup waiting for LSN if any.
+	 */
+	WaitLSNCleanup();
 
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();

@@ -13,11 +13,13 @@
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_class_d.h"
 #include "fe_utils/string_utils.h"
+#include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
 #include "common/unicode_version.h"
 
 static void check_new_cluster_is_empty(void);
 static void check_is_install_user(ClusterInfo *cluster);
+static void check_for_unsupported_encodings(ClusterInfo *cluster);
 static void check_for_connection_status(ClusterInfo *cluster);
 static void check_for_prepared_transactions(ClusterInfo *cluster);
 static void check_for_isn_and_int8_passing_mismatch(ClusterInfo *cluster);
@@ -34,6 +36,7 @@ static void check_new_cluster_replication_slots(void);
 static void check_new_cluster_subscription_configuration(void);
 static void check_old_cluster_for_valid_slots(void);
 static void check_old_cluster_subscription_state(void);
+static void check_old_cluster_global_names(ClusterInfo *cluster);
 
 /*
  * DataTypesUsageChecks - definitions of data type checks for the old cluster
@@ -481,8 +484,8 @@ check_for_data_types_usage(ClusterInfo *cluster)
 	}
 
 	/* Allocate memory for queries and for task states */
-	queries = pg_malloc0(sizeof(char *) * n_data_types_usage_checks);
-	states = pg_malloc0(sizeof(struct data_type_check_state) * n_data_types_usage_checks);
+	queries = pg_malloc0_array(char *, n_data_types_usage_checks);
+	states = pg_malloc0_array(struct data_type_check_state, n_data_types_usage_checks);
 
 	for (int i = 0; i < n_data_types_usage_checks; i++)
 	{
@@ -599,6 +602,19 @@ check_and_dump_old_cluster(void)
 	 * fail in later stages.
 	 */
 	check_for_connection_status(&old_cluster);
+
+	/*
+	 * Check for encodings that are no longer supported.
+	 */
+	check_for_unsupported_encodings(&old_cluster);
+
+	/*
+	 * Validate database, user, role and tablespace names from the old
+	 * cluster. No need to check in 19 or newer as newline and carriage return
+	 * are not allowed at the creation time of the object.
+	 */
+	if (GET_MAJOR_VERSION(old_cluster.major_version) < 1900)
+		check_old_cluster_global_names(&old_cluster);
 
 	/*
 	 * Extract a list of databases, tables, and logical replication slots from
@@ -969,7 +985,7 @@ check_for_new_tablespace_dir(void)
 	int			tblnum;
 	char		new_tablespace_dir[MAXPGPATH];
 
-	prep_status("Checking for new cluster tablespace directories");
+	prep_status("Checking new cluster tablespace directories");
 
 	for (tblnum = 0; tblnum < new_cluster.num_tablespaces; tblnum++)
 	{
@@ -1223,6 +1239,64 @@ check_for_connection_status(ClusterInfo *cluster)
 				 "which cannot be connected to.  Consider allowing connection for all\n"
 				 "non-template0 databases or drop the databases which do not allow\n"
 				 "connections.  A list of databases with the problem is in the file:\n"
+				 "    %s", output_path);
+	}
+	else
+		check_ok();
+}
+
+
+/*
+ * check_for_unsupported_encodings()
+ */
+static void
+check_for_unsupported_encodings(ClusterInfo *cluster)
+{
+	int			i_datname;
+	int			i_encoding;
+	int			ntups;
+	PGresult   *res;
+	PGconn	   *conn;
+	FILE	   *script = NULL;
+	char		output_path[MAXPGPATH];
+
+	prep_status("Checking for unsupported encodings");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "databases_unsupported_encoding.txt");
+
+	conn = connectToServer(cluster, "template1");
+
+	res = executeQueryOrDie(conn,
+							"SELECT datname, encoding "
+							"FROM pg_catalog.pg_database");
+	ntups = PQntuples(res);
+	i_datname = PQfnumber(res, "datname");
+	i_encoding = PQfnumber(res, "encoding");
+	for (int rowno = 0; rowno < ntups; rowno++)
+	{
+		char	   *datname = PQgetvalue(res, rowno, i_datname);
+		int			encoding = atoi(PQgetvalue(res, rowno, i_encoding));
+
+		if (!PG_VALID_BE_ENCODING(encoding))
+		{
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %m", output_path);
+
+			fprintf(script, "%s\n", datname);
+		}
+	}
+	PQclear(res);
+	PQfinish(conn);
+
+	if (script)
+	{
+		fclose(script);
+		pg_log(PG_REPORT, "fatal");
+		pg_fatal("Your installation contains databases using encodings that are\n"
+				 "no longer supported.  Consider dumping and restoring with UTF8.\n"
+				 "A list of databases with unsupported encodings is in the file:\n"
 				 "    %s", output_path);
 	}
 	else
@@ -1785,10 +1859,10 @@ check_for_gist_inet_ops(ClusterInfo *cluster)
 	{
 		fclose(report.file);
 		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains indexes that use btree_gist's\n"
-				 "gist_inet_ops or gist_cidr_ops opclasses,\n"
-				 "which cannot be binary-upgraded.  Replace them with indexes\n"
-				 "that use the built-in GiST inet_ops opclass.\n"
+		pg_fatal("Your installation contains indexes that use btree_gist extension's\n"
+				 "gist_inet_ops or gist_cidr_ops operator classes, which cannot be\n"
+				 "binary-upgraded.  Replace them with indexes that use the built-in GiST\n"
+				 "inet_ops operator class.\n"
 				 "A list of indexes with the problem is in the file:\n"
 				 "    %s", report.path);
 	}
@@ -2120,11 +2194,11 @@ check_for_unicode_update(ClusterInfo *cluster)
  * check_new_cluster_replication_slots()
  *
  * Validate the new cluster's readiness for migrating replication slots:
- * - Ensures no existing logical replication slots on the new cluster when
+ * - Ensures no existing logical replication slots in the new cluster when
  *   migrating logical slots.
- * - Ensure conflict detection slot does not exist on the new cluster when
+ * - Ensure conflict detection slot does not exist in the new cluster when
  *   migrating subscriptions with retain_dead_tuples enabled.
- * - Ensure that the parameter settings on the new cluster necessary for
+ * - Ensure that the parameter settings in the new cluster necessary for
  *   creating slots are sufficient.
  */
 static void
@@ -2158,7 +2232,7 @@ check_new_cluster_replication_slots(void)
 
 	conn = connectToServer(&new_cluster, "template1");
 
-	prep_status("Checking for new cluster replication slots");
+	prep_status("Checking new cluster replication slots");
 
 	res = executeQueryOrDie(conn, "SELECT %s AS nslots_on_new, %s AS rdt_slot_on_new "
 							"FROM pg_catalog.pg_replication_slots",
@@ -2189,7 +2263,7 @@ check_new_cluster_replication_slots(void)
 	if (rdt_slot_on_new)
 	{
 		Assert(old_cluster.sub_retain_dead_tuples);
-		pg_fatal("The replication slot \"pg_conflict_detection\" already exists on the new cluster");
+		pg_fatal("replication slot \"%s\" already exists in the new cluster", "pg_conflict_detection");
 	}
 
 	PQclear(res);
@@ -2250,7 +2324,7 @@ check_new_cluster_subscription_configuration(void)
 	if (old_cluster.nsubs == 0)
 		return;
 
-	prep_status("Checking for new cluster configuration for subscriptions");
+	prep_status("Checking new cluster configuration for subscriptions");
 
 	conn = connectToServer(&new_cluster, "template1");
 
@@ -2284,7 +2358,7 @@ check_old_cluster_for_valid_slots(void)
 	char		output_path[MAXPGPATH];
 	FILE	   *script = NULL;
 
-	prep_status("Checking for valid logical replication slots");
+	prep_status("Checking logical replication slots");
 
 	snprintf(output_path, sizeof(output_path), "%s/%s",
 			 log_opts.basedir,
@@ -2410,7 +2484,7 @@ check_old_cluster_subscription_state(void)
 	PGconn	   *conn;
 	int			ntup;
 
-	prep_status("Checking for subscription state");
+	prep_status("Checking subscription state");
 
 	report.file = NULL;
 	snprintf(report.path, sizeof(report.path), "%s/%s",
@@ -2496,6 +2570,76 @@ check_old_cluster_subscription_state(void)
 				 "You can allow the initial sync to finish for all relations and then restart the upgrade.\n"
 				 "A list of the problematic subscriptions is in the file:\n"
 				 "    %s", report.path);
+	}
+	else
+		check_ok();
+}
+
+/*
+ * check_old_cluster_global_names()
+ *
+ * Raise an error if any database, role, or tablespace name contains a newline
+ * or carriage return character.  Such names are not allowed in v19 and later.
+ */
+static void
+check_old_cluster_global_names(ClusterInfo *cluster)
+{
+	int			i;
+	PGconn	   *conn_template1;
+	PGresult   *res;
+	int			ntups;
+	FILE	   *script = NULL;
+	char		output_path[MAXPGPATH];
+	int			count = 0;
+
+	prep_status("Checking names of databases, roles, and tablespaces");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "db_role_tablespace_invalid_names.txt");
+
+	conn_template1 = connectToServer(cluster, "template1");
+
+	/*
+	 * Get database, user/role and tablespace names from cluster.  Can't use
+	 * pg_authid because only superusers can view it.
+	 */
+	res = executeQueryOrDie(conn_template1,
+							"SELECT datname AS objname, 'database' AS objtype "
+							"FROM pg_catalog.pg_database UNION ALL "
+							"SELECT rolname AS objname, 'role' AS objtype "
+							"FROM pg_catalog.pg_roles UNION ALL "
+							"SELECT spcname AS objname, 'tablespace' AS objtype "
+							"FROM pg_catalog.pg_tablespace ORDER BY 2 ");
+
+	ntups = PQntuples(res);
+	for (i = 0; i < ntups; i++)
+	{
+		char	   *objname = PQgetvalue(res, i, 0);
+		char	   *objtype = PQgetvalue(res, i, 1);
+
+		/* If name has \n or \r, then report it. */
+		if (strpbrk(objname, "\n\r"))
+		{
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %m", output_path);
+
+			fprintf(script, "%d : %s name = \"%s\"\n", ++count, objtype, objname);
+		}
+	}
+
+	PQclear(res);
+	PQfinish(conn_template1);
+
+	if (script)
+	{
+		fclose(script);
+		pg_log(PG_REPORT, "fatal");
+		pg_fatal("Your installation contains databases, roles, or tablespace with names\n"
+				 "with invalid characters (newline or carriage return).  To fix this,\n"
+				 "rename these objects.\n"
+				 "A list of all objects with invalid names is in the file:\n"
+				 "    %s", output_path);
 	}
 	else
 		check_ok();
