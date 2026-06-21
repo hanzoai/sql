@@ -1,0 +1,10 @@
+postgres
+Copyright (c) 2024 Hanzo AI Inc
+
+This product includes software from the PostgreSQL Database Management System
+(https://www.postgresql.org/), licensed under the PostgreSQL License
+(see COPYRIGHT):
+
+    Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+
+    Portions Copyright (c) 1994, The Regents of the University of California
