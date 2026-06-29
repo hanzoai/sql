@@ -1,3 +1,5 @@
+<p align="center"><img src=".github/hero.svg" alt="sql" width="880"></p>
+
 PostgreSQL Database Management System
 =====================================
 
