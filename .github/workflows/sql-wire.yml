@@ -1,0 +1,44 @@
+# Hanzo SQL (pg-wire) — multi-tenant Postgres-wire endpoint over pglite.
+#
+# This repo hosts TWO independently-released images:
+#   - ghcr.io/hanzoai/sql       (the Postgres source fork) — built by deploy.yml
+#                                on plain `v*` tags (v16.0.0, v18.0.0, …).
+#   - ghcr.io/hanzoai/sql-wire  (this tiny Node sidecar)   — built HERE.
+#
+# The two have INDEPENDENT semver cadences, so sql-wire owns a DISTINCT tag
+# namespace `sql-wire-v*` (e.g. sql-wire-v0.1.0). This fully decouples it from
+# the Postgres fork's `v*` tags — a wire release never triggers a Postgres
+# rebuild and vice-versa — while still publishing a clean semver image tag
+# (`ghcr.io/hanzoai/sql-wire:0.1.0`, never :latest, never sha).
+#
+# Runs on the hanzoai self-hosted amd64 pool (hanzo-build-linux-amd64). amd64
+# only per the Docker Build Standard (DOKS has no arm64).
+name: sql-wire
+on:
+  workflow_dispatch:
+  push:
+    tags: ['sql-wire-v*']
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: [self-hosted, linux, amd64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive semver from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#sql-wire-v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: managed/wire
+          file: managed/wire/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/hanzoai/sql-wire:${{ steps.v.outputs.version }}
