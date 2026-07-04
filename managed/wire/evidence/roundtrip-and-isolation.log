@@ -1,0 +1,18 @@
+node:1: command not found: _nvm_lazy_load
+=== 1. dataroomdb: migrated schema is present (post migrate deploy) ===
+applied migrations recorded: 107
+public tables in dataroomdb: 63
+pg ENUM types in dataroomdb: 18
+
+=== 2. full pg-dialect CRUD round-trip on tenant_alpha (fresh db) ===
+row: {"tags":["a","b","c"],"m":"happy","meta":{"k":1},"blob":"hi","has_uuid":true}
+array_append: ["a","b","c","d"]
+
+=== 3. multi-tenant ISOLATION: tenant_beta is a separate db/dir ===
+tenant_beta.t.who: beta-only
+tenant_alpha.t columns: id,tags,m,blob,meta,created
+tenant_beta.t  columns: id,who
+dataroom _prisma_migrations visible from tenant_beta? count = 0 (ISOLATED)
+
+=== 4. persistence note: data dirs on disk ===
+OK

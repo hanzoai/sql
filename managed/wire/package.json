@@ -1,0 +1,20 @@
+{
+  "name": "@hanzo/sql-wire",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hanzo SQL (pg-wire) — multi-tenant Postgres-wire endpoint over pglite; one dir per tenant db, provision-on-demand",
+  "bin": {
+    "hanzo-sql-wire": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.4",
+    "@electric-sql/pglite-socket": "0.2.7"
+  }
+}
