@@ -18,90 +18,102 @@ rewrite, because it IS Postgres. Literal-SQLite (postlite) rejects those
 schemas at the dialect layer (scalar arrays + native types) before any wire is
 involved — a dead end for our fork schemas.
 
-## How it works (`server.mjs`, ~180 LOC)
+## How it works (`server.mjs`, ~230 LOC)
 
-One TCP listener on `:5432`. Per connection:
+One TCP listener on `:5432`. The router **terminates the pg wire protocol** and
+drives pglite's `execProtocolRaw` directly. It does **not** use
+`@electric-sql/pglite-socket` — that library's per-message forwarding emits a
+premature `ReadyForQuery` and hangs strict clients (asyncpg), and it crashes
+pglite outright on `COPY … FROM stdin`.
 
-1. **Peek** the pg startup packet. Answer any leading `SSLRequest` /
-   `GSSENCRequest` with `N` (in-cluster traffic is on the pod network), then
-   read the `StartupMessage` and extract the `database` field.
-2. **Validate** the dbname against `^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$` (defeats
-   path traversal; mirrors the 63-byte pg identifier limit). Bad name → a FATAL
-   `ErrorResponse` and close.
-3. **Resolve** (or lazily create — provision-on-demand) that tenant's pglite
-   instance at `/data/<dbname>`, fronted by a per-tenant `PGLiteSocketServer`
-   bound to a private Unix socket (`$HANZO_SQL_SOCKDIR/<dbname>.sock`). A
-   Promise-cache guarantees one instance per dir (never two writers).
-4. **Splice** the client TCP socket to the tenant's Unix socket, forwarding the
-   buffered `StartupMessage` first.
+Per connection:
 
-The router is only a startup-peeking dispatcher. The library
-(`@electric-sql/pglite-socket`) owns the wire protocol, per-db query
-serialization (`QueryQueueManager`), and multi-connection handling — we reuse
-its tested logic instead of reimplementing its (unexported) queue. Concurrent
-connections to the same db share that db's serialized queue (correct MVCC via
-pglite); two different dbnames get two dirs = fully isolated data.
+1. **Peek** the startup packet: answer any `SSLRequest`/`GSSENCRequest` with `N`
+   (in-cluster traffic is on the pod network), read the `StartupMessage`, extract
+   the `database` field, validate it (`^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$`, defeats
+   path traversal). Bad name → FATAL `ErrorResponse`.
+2. **Resolve** (or lazily create — provision-on-demand) that tenant's pglite
+   instance at `/data/<dbname>` (Promise-cache = one instance per dir).
+3. **Drive** the session: the startup message and every subsequent frontend
+   message **batch** go to `db.execProtocolRaw`. Messages are batched to each
+   `Sync`/`Flush`/simple-`Query` boundary so a pipelined extended-protocol
+   prepare (`Parse`+`Describe`+`Sync`) is processed atomically — the fix that
+   makes strict clients (asyncpg) work.
+
+Three protocol details the router owns (pglite/one-session-per-dir quirks):
+
+- **`COPY … FROM stdin` is intercepted.** Sent over the raw wire it *crashes*
+  pglite; instead the router captures `CopyData`/`CopyDone`, rewrites the SQL to
+  `COPY … FROM '/dev/blob'`, runs pglite's programmatic COPY, and synthesizes
+  `CopyInResponse`/`CommandComplete`/`ReadyForQuery`. `COPY … TO stdout` needs no
+  special handling (works over the raw wire). This is what makes a
+  `pg_dump | psql` data load work.
+- **Named statements/portals are namespaced per connection.** pglite is ONE
+  backend session per data dir, but prepared statements are session-scoped in
+  Postgres. Without isolation, connection B reusing a name connection A prepared
+  (e.g. asyncpg's `__asyncpg_stmt_1__` across a pool) collides
+  ("prepared statement already exists"). The router prefixes every non-empty
+  name in `Parse`/`Bind`/`Describe`/`Close`/`Execute` with a per-connection tag.
+- **`Terminate` closes only that socket** — never forwarded to the shared session
+  (which would tear it down for every other connection on the tenant).
+
+Per-db serialization with transaction affinity keeps the single shared session
+consistent: while a transaction is open, only its owning connection's messages
+run; a connection that dies mid-transaction is rolled back.
 
 ## Config (env)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `HANZO_SQL_DATA` | `/data` | base dir; per-tenant data dir is `<DATA>/<dbname>` (PVC-mounted) |
-| `HANZO_SQL_SOCKDIR` | `$TMPDIR/hanzo-sql` | per-tenant Unix sockets (ephemeral; keep short — `sun_path` ≤ ~104 bytes) |
+| `HANZO_SQL_LISTEN_PORT` | `5432` | listen port. **Not `HANZO_SQL_PORT`** — a k8s service-link injects `<SVC>_PORT=tcp://…` for the `hanzo-sql` alias, which would shadow it (`Number("tcp://…")=NaN` → crash). The code reads the legacy `HANZO_SQL_PORT` too, but ignores it unless it parses as an integer. |
 | `HANZO_SQL_HOST` | `0.0.0.0` | listen host |
-| `HANZO_SQL_PORT` | `5432` | listen port |
-| `HANZO_SQL_MAX_CONN` | `1000` | max concurrent connections per tenant db |
 | `HANZO_SQL_DEBUG` | — | `1` for verbose logs |
 
-## Proof (see `evidence/`)
+## Verified clients (see `evidence/`)
 
-- **`dataroom-prisma-migrate-deploy.log`** — the real **dataroom** (Papermark
-  fork) schema, `provider = "postgresql"`, **107 migrations**, run via
-  `prisma migrate deploy` against `postgres://…@…:5432/dataroomdb` pointed at
-  this router. Result: `All migrations have been successfully applied.`
-  (63 public tables, 18 pg ENUM types recorded).
-- **`roundtrip-and-isolation.log`** (`roundtrip.mjs`) — full pg-dialect CRUD
-  over the wire (`text[]`, enum, `bytea`, `jsonb`, `gen_random_uuid`,
-  `timestamptz`, `array_append`) + multi-tenant **isolation**: `tenant_alpha`
-  and `tenant_beta` get separate dirs/data; `tenant_beta` cannot see dataroom's
-  tables. Verified surviving a full server restart (persistence).
-- **`pglite-feature-support.log`** (`features.mjs`) — honest feature matrix.
+| Client | Status | Evidence |
+|--------|--------|----------|
+| **node-postgres / Prisma** | ✓ full | `dataroom-prisma-migrate-deploy.log` (real Papermark schema, `provider=postgresql`, **107 migrations**, `prisma migrate deploy` → all applied; 63 tables, 18 enums), `roundtrip-and-isolation.log` |
+| **psql** | ✓ incl. COPY | `copy-roundtrip-parity.log` — `\copy … TO` (raw) + `\copy … FROM` (intercepted) round-trip with **byte-exact row parity** (`src EXCEPT dst = 0`), across NULL, empty array, unicode, embedded tab/newline, apostrophe, quoted array element, and a **0-row table** (pg_dump emits COPY even for empty tables) |
+| **asyncpg** (Python) | ✓ incl. default statement cache, pools, reconnect | `asyncpg-roundtrip.log` — single conn + a 5-connection pool + sequential reconnect to the same tenant (the named-statement collision case) |
 
 ### What does NOT work in pglite (honest)
 
 `CREATE EXTENSION` for `pgcrypto` / `uuid-ossp` / `pg_trgm` / `vector` /
-`citext` fails at runtime: **pglite extensions must be pre-registered at
-instance creation** (`PGlite.create(dir, { extensions: { … } })`), not loaded
-via runtime `CREATE EXTENSION`. The MVP preloads none, so only built-ins are
-available. `gen_random_uuid()` is a **built-in** (pg13+) and works, which
-covers the common Prisma default. dataroom's 107 migrations use no extension —
-so for that real fork schema, **zero** features failed. Everything else works:
-generated columns, partitioned tables, `LISTEN`/`NOTIFY`, materialized views,
-full-text search, jsonb ops, window functions, arrays, enums, native types.
-Follow-up: preload the common extension set (pgvector, pg_trgm, uuid-ossp).
+`citext` fails at runtime — pglite extensions must be **pre-registered at
+instance creation** (`PGlite.create(dir, { extensions })`), not loaded via SQL.
+The MVP preloads none. `gen_random_uuid()` is a **built-in** (pg13+) and works
+(the common Prisma default). dataroom's 107 migrations use no extension — for
+that real fork schema, **zero** features fail. `pglite-feature-support.log` has
+the matrix (generated columns, partitioning, LISTEN/NOTIFY, matviews, FTS,
+jsonb, window fns, arrays, enums, native types all OK). Follow-up: preload the
+common extension set (pgvector, pg_trgm, uuid-ossp).
 
-Single-writer note: pglite serializes writes per db (one WASM instance per
-dir). Correct, but not a multi-writer cluster — matches the per-tenant model.
+Single-session note: pglite is one backend session per data dir, so writes are
+serialized and concurrent transactions from different connections cannot truly
+overlap (they queue). Correct for the per-tenant / migration-target model; not a
+multi-writer cluster.
 
 ## Image + deploy
 
-- Image **`ghcr.io/hanzoai/sql-wire`**, semver tags only (`0.1.0`, …) — never
+- Image **`ghcr.io/hanzoai/sql-wire`**, semver tags only (`0.1.1`, …) — never
   `:latest`, never `sha-…`. Built by `.github/workflows/sql-wire.yml` on
   `sql-wire-v*` git tags (distinct from the Postgres fork's `v*` tags), on the
-  hanzoai `hanzo-build-linux-amd64` pool. Base `ghcr.io/hanzoai/nodejs:v24.18.0`.
+  `hanzo-build-linux-amd64` pool. Base `ghcr.io/hanzoai/nodejs:v24.18.0`.
 - K8s: an operator `Service` CR (`hanzo.ai/v1`) named `hanzo-sql-wire`, port
-  5432, a **plain PVC** volume at `/data` (NOT `spec.persistence` — that injects
-  the `hanzoai/replicate` SQLite-WAL sidecar, which is WRONG for a pg data dir),
-  `fsGroup: 65532` so the non-root image can write the PVC.
-  Manifest: `universe/infra/k8s/operator/crs/hanzo-sql-wire.yaml`.
-- A consumer points at it with, e.g.:
+  5432, a **plain PVC** at `/data` (NOT `spec.persistence` — that injects the
+  `hanzoai/replicate` SQLite-WAL sidecar, WRONG for a pg data dir),
+  `fsGroup: 65532`. Manifest:
+  `universe/infra/k8s/operator/crs/hanzo-sql-wire.yaml`.
+- A consumer points at it with:
   `DATABASE_URL=postgres://hanzo:pw@hanzo-sql-wire.hanzo.svc:5432/<dbname>`
-  (pglite uses trust auth — the password is ignored; isolation is the pod
-  network + one dir per db).
+  (pglite uses trust auth — password ignored; isolation is the pod network +
+  one dir per db).
 
 ## Files
 
-    server.mjs            the multi-tenant startup-peeking router
-    package.json          pinned deps (pglite 0.5.4, pglite-socket 0.2.7)
+    server.mjs            the multi-tenant wire router (drives pglite execProtocolRaw)
+    package.json          pinned dep (pglite 0.5.4)
     Dockerfile            ghcr.io/hanzoai/sql-wire (amd64)
-    evidence/             raw prisma / round-trip / feature output backing every claim
+    evidence/             raw prisma / COPY-parity / asyncpg / feature output backing every claim
