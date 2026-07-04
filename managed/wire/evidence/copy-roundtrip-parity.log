@@ -1,0 +1,24 @@
+=== build source w/ edge cases (NULL, empty array, unicode, tab, apostrophe) ===
+=== COPY OUT (raw wire): src -> file ===
+COPY 4
+COPY 0
+     185 /private/tmp/claude-501/-Users-z-work-hanzo-hanzo-ai/e413594f-4028-4b99-be20-41bf17b66c0a/scratchpad/wiretest/src.copy
+       0 /private/tmp/claude-501/-Users-z-work-hanzo-hanzo-ai/e413594f-4028-4b99-be20-41bf17b66c0a/scratchpad/wiretest/src_empty.copy
+     185 total
+=== COPY IN (intercepted -> programmatic): file -> dst ===
+COPY 4
+COPY 0
+=== PARITY ===
+src rows   = 4
+dst rows   = 4
+src EXCEPT dst (want 0) = 0
+dst EXCEPT src (want 0) = 0
+src_empty=0 dst_empty=0 (both 0)
+--- dst edge rows ---
+id|name|tags|note|amt
+1|alice|{x,y}|plain|3.14
+2|bob||tab	here|
+3|café|{}|line1
+line2|-0.5
+4|quote|{a,"b c"}|has 'apos'|1000000
+(4 rows)
