@@ -1,0 +1,13 @@
+FAIL pgcrypto ext -> extension "pgcrypto" is not available
+FAIL uuid-ossp ext -> extension "uuid-ossp" is not available
+FAIL pg_trgm ext -> extension "pg_trgm" is not available
+FAIL vector ext -> extension "vector" is not available
+FAIL citext ext -> extension "citext" is not available
+OK   gen_random_uuid builtin
+OK   generated column
+OK   partitioned table
+OK   LISTEN/NOTIFY
+OK   materialized view
+OK   full text search
+OK   json/jsonb ops
+OK   window function
