@@ -1,0 +1,13 @@
+### asyncpg (DEFAULT statement cache) — single connection
+connecting (DEFAULT statement cache)...
+CONNECTED
+q1 SELECT 1 -> 1
+q2 cached SELECT 1 -> 1
+q3 param -> 42
+ASYNCPG DEFAULT OK
+
+### asyncpg POOL (5 conns) + sequential RECONNECT to same tenant (the collision case)
+reconnect 1: rows now 1
+reconnect 2: rows now 2
+pool workers ok, counts: [2, 2, 2, 2, 2]
+ASYNCPG POOL+RECONNECT OK
