@@ -1,0 +1,41 @@
+diff --git a/scripts/backfill-pg-to-sqlite.ts b/scripts/backfill-pg-to-sqlite.ts
+index bee5737f7..08a6be8e5 100644
+--- a/scripts/backfill-pg-to-sqlite.ts
++++ b/scripts/backfill-pg-to-sqlite.ts
+@@ -41,7 +41,26 @@
+ import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+ import process from 'node:process';
+ import { DatabaseSync } from 'node:sqlite';
+-import { Client } from 'pg';
++import { Client, types } from 'pg';
++
++/**
++ * node-pg parses built-in `text[]` (_text, OID 1009) into a JS array, but a
++ * column typed as an ARRAY OF A CUSTOM ENUM (e.g. `Role[]`, `WebhookTriggerEvents[]`)
++ * has a per-database dynamic OID node-pg has no parser for, so it hands back the
++ * raw literal `{ADMIN,USER}` as a string. That trips toSqlite's fail-closed
++ * array guard. Reuse node-pg's own text-array parser for every enum-array OID so
++ * enum arrays decode to `string[]` exactly like `text[]`.
++ */
++const registerEnumArrayParsers = async (pg: Client): Promise<number> => {
++  const textArrayParser = types.getTypeParser(1009); // _text
++  const res = await pg.query(
++    `SELECT arr.oid FROM pg_type arr
++       JOIN pg_type el ON el.oid = arr.typelem
++      WHERE arr.typcategory = 'A' AND el.typtype = 'e'`,
++  );
++  for (const { oid } of res.rows) types.setTypeParser(oid as number, textArrayParser);
++  return res.rows.length;
++};
+ 
+ type Arg = { batch: number; fresh: boolean };
+ 
+@@ -166,6 +185,8 @@ async function main() {
+ 
+   const pg = new Client({ connectionString: pgUrl });
+   await pg.connect();
++  const enumArrayOids = await registerEnumArrayParsers(pg);
++  console.log(`[backfill] registered enum-array parsers for ${enumArrayOids} OID(s)`);
+ 
+   let totalCopied = 0;
+ 

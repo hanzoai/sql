@@ -1,0 +1,56 @@
+# Hanzo SQL — managed pg-wire endpoint (OPTION-A follow-up path).
+#
+# Declarative provisioning via the existing `SQL` datastore Kind (operator
+# facade over DatastoreSpec — same StatefulSet + ClusterIP Service + headless
+# `<name>-hs` + per-replica PVC machinery that backs `docdb`). This reuse is the
+# one-way: no new CRD. The only change from the legacy Postgres `crs/sql.yaml`
+# is the image — swap `ghcr.io/hanzoai/sql:18` (the shared Postgres we are
+# retiring) for the embedded-Postgres pg-wire endpoint.
+#
+# A tenant that needs an isolated `postgres://` = one such CR (or a
+# `ManagedDatabase` CR, the paid isolated-tenant facade). Consumer DNS =
+# `<name>.<ns>.svc.cluster.local:5432`. The DATABASE_URL is synced to the
+# consumer via a KMSSecret CR → k8s Secret → env `DATABASE_URL` valueFrom
+# secretKeyRef (same path docdb uses for MONGO_URI).
+apiVersion: hanzo.ai/v1
+kind: SQL
+metadata:
+  name: hanzo-sql
+  namespace: hanzo
+spec:
+  type: postgresql            # pg-wire; endpoint speaks the Postgres protocol
+  image:
+    repository: ghcr.io/hanzoai/sql-managed
+    tag: "v0.1.0"             # semver only — never :latest, never sha
+    pullPolicy: IfNotPresent
+  replicas: 1                 # pglite is single-writer per data dir; do not scale >1
+  storage:
+    storageClassName: do-block-storage
+    size: 10Gi
+    retentionPolicy: Retain
+  ports:
+    - name: data
+      containerPort: 5432
+      protocol: TCP
+  env:
+    - name: HANZO_SQL_DATA
+      value: /data/db
+  # The operator creates the `data` PVC (volumeClaimTemplate) but does NOT
+  # auto-mount it — the CR must mount it explicitly.
+  volumeMounts:
+    - name: data
+      mountPath: /data
+  serviceAliases:
+    - postgres
+  imagePullSecrets:
+    - name: ghcr-secret
+  partOf: data
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: "1", memory: 1Gi }
+# KNOWN GAP (blocker for this follow-up): DatastoreSpec has no `fsGroup`
+# (only the `Service` Kind does). The sql-managed image runs nonroot (65532)
+# and cannot write a root-owned DO-block PVC without an fsGroup. Fix = add
+# `fsGroup` to DatastoreSpec in operator/src/crd.rs + set it to 65532 here.
+# Until then, host the endpoint on the `Service` Kind (has fsGroup+persistence)
+# or run the image as root.
