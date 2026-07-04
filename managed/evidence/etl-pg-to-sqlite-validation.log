@@ -1,0 +1,76 @@
+### Hanzo SQL — pg->SQLite ETL end-to-end validation (synthetic data, no prod)
+### source: real Hanzo Postgres 18 (ghcr.io/hanzoai/sql:18), pre-conversion esign schema, 4554 seeded rows
+### target: fresh SQLite built from esign packages/prisma/migrations/0_init/migration.sql
+### script: esign/scripts/backfill-pg-to-sqlite.ts + enum-array-parser.patch
+
+===== BACKFILL RUN =====
+[backfill] registered enum-array parsers for 29 OID(s)
+[backfill] User: 1000 rows
+[backfill] User: 2000 rows
+[backfill] User: 3000 rows
+[backfill] User: 3002 rows
+[backfill] User: 3002 rows ✓
+[backfill] UserSecurityAuditLog: 1000 rows
+[backfill] UserSecurityAuditLog: 1000 rows ✓
+[backfill] Passkey: 501 rows
+[backfill] Passkey: 501 rows ✓
+[backfill] SiteSettings: 51 rows
+[backfill] SiteSettings: 51 rows ✓
+[backfill] done — 4554 rows copied into /private/tmp/claude-501/-Users-z-work-hanzo-hanzo-ai/e413594f-4028-4b99-be20-41bf17b66c0a/scratchpad/sqltest/sign.db
+
+===== PARITY + TYPE-EXACT ANCHORS =====
+== ROW-COUNT PARITY (pg vs sqlite) ==
+  User                   pg= 3002  sqlite= 3002  OK
+  Passkey                pg=  501  sqlite=  501  OK
+  UserSecurityAuditLog   pg= 1000  sqlite= 1000  OK
+  SiteSettings           pg=   51  sqlite=   51  OK
+  parity: ALL OK
+
+== ANCHOR: User anchor@x.com (enum-array, datetime->epoch-ms, bool, scalar enum) ==
+  {"t_roles":"text","roles":"[\"ADMIN\",\"USER\"]","t_ev":"integer","emailVerified":1783168496789,"disabled":1,"twoFactorEnabled":0,"identityProvider":"GOOGLE"}
+  expect roles=TEXT ["ADMIN","USER"]  emailVerified=INTEGER 1783168496789
+
+== ANCHOR: User anchor-null (null datetime) ==
+  {"roles":"[\"USER\"]","emailVerified":null,"t":"null"}
+
+== ANCHOR: Passkey pk-anchor (bytea->BLOB, bigint, string-array, null) ==
+file:///private/tmp/claude-501/-Users-z-work-hanzo-hanzo-ai/e413594f-4028-4b99-be20-41bf17b66c0a/scratchpad/sqltest/validate.mjs:25
+const pk = s.prepare(`select typeof("credentialId") t_cid, hex("credentialId") cid, hex("credentialPublicKey") cpk, typeof(counter) t_ctr, counter, transports, "credentialBackedUp", "lastUsedAt" from "Passkey" where id='pk-anchor'`).get()
+                                                                                                                                                                                                                                         ^
+
+RangeError: Value is too large to be represented as a JavaScript number: 9007199254740993
+    at file:///private/tmp/claude-501/-Users-z-work-hanzo-hanzo-ai/e413594f-4028-4b99-be20-41bf17b66c0a/scratchpad/sqltest/validate.mjs:25:234
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5) {
+  code: 'ERR_OUT_OF_RANGE'
+}
+
+Node.js v26.4.0
+== ANCHOR: Passkey pk-anchor (bytea->BLOB, bigint int64, string-array, null) ==
+  {"t_cid":"blob","cid":"DEADBEEF00","cpk":"0001020304","t_ctr":"integer","counter":"9007199254740993n","transports":"[\"usb\",\"nfc\",\"internal\"]","credentialBackedUp":"1n","lastUsedAt":null}
+  expect cid=DEADBEEF00 cpk=0001020304 counter=9007199254740993n transports=["usb","nfc","internal"] backedUp=1 lastUsedAt=null
+
+== ANCHOR: SiteSettings ss-anchor (jsonb->TEXT verbatim, bool) ==
+  {"t":"text","data":"{\"a\":1,\"b\":[true,null,\"x\"],\"nested\":{\"k\":\"v\"}}","enabled":0}
+
+== ENUM-ARRAY distribution (User.roles as JSON TEXT) ==
+   {"roles":"[\"USER\"]","n":2001}
+   {"roles":"[\"ADMIN\",\"USER\"]","n":1001}
+
+== SCALAR ENUM distribution (UserSecurityAuditLog.type) ==
+   {"type":"PASSKEY_CREATED","n":200}
+   {"type":"PASSWORD_UPDATE","n":200}
+   {"type":"SIGN_IN","n":200}
+   {"type":"SIGN_IN_FAIL","n":200}
+   {"type":"SIGN_OUT","n":200}
+
+== counter int64 fidelity: max/min counter ==
+  {"mx":"9007199254740993n","mn":"1000n"}
+
+===== esign PRISMA CLIENT READ-BACK =====
+esign Prisma client: User.count() = 3002
+User anchor  emailVerified = 2026-07-04T12:34:56.789Z (instanceof Date: true ) roles = ["ADMIN","USER"]  identityProvider = GOOGLE  disabled = true
+User anchor-null emailVerified = null
+Passkey anchor credentialId = deadbeef00 (is Uint8Array: true ) counter = 9007199254740993n (typeof bigint) transports = ["usb","nfc","internal"]
+SiteSettings anchor data = {"a":1,"b":[true,null,"x"],"nested":{"k":"v"}} (typeof object) enabled = false
+UserSecurityAuditLog.count() = 1000
+ESIGN PRISMA READ-BACK = PASS

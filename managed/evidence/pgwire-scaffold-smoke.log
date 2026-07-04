@@ -1,0 +1,3 @@
+### pgwire/server.mjs smoke test — full pg dialect via the scaffold (enum + text[] + gen_random_uuid)
+[hanzo-sql] pg-wire on 0.0.0.0:55442 data=/private/tmp/claude-501/-Users-z-work-hanzo-hanzo-ai/e413594f-4028-4b99-be20-41bf17b66c0a/scratchpad/sqltest/smoke-data/db
+roundtrip: {"tags":["a","b","c"],"m":"happy","has_uuid":true}

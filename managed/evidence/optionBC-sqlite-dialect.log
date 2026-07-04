@@ -1,0 +1,121 @@
+Prisma schema loaded from prisma-sqlite
+Datasource "db": SQLite database "tenant.db" at "file:./tenant.db"
+
+SQLite database tenant.db created at file:./tenant.db
+Error: P1012
+
+error: Field "pages" in model "DocumentAnnotation" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/annotation.prisma:5
+   | 
+ 4 |   content      Json     // Rich text content stored as JSON (Tiptap/ProseMirror format)
+ 5 |   pages        Int[]    // Array of page numbers this annotation applies to
+ 6 |   documentId   String
+   | 
+error: Field "tags" in model "DataroomFaqItem" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/conversation.prisma:195
+   | 
+194 |   // Optional categorization
+195 |   tags String[] @default([])
+196 | 
+   | 
+error: Field "domains" in model "ViewerGroup" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/dataroom.prisma:130
+   | 
+129 |   members        ViewerGroupMembership[]
+130 |   domains        String[]
+131 |   links          Link[]
+   | 
+error: Field "embeddedLinks" in model "DocumentPage" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/document.prisma:80
+   | 
+79 |   pageNumber    Int // e.g., 1, 2, 3 for 
+80 |   embeddedLinks String[]
+81 |   pageLinks     Json? // This will store the page links data: [{href: "https://example.com", coords: "0,0,100,100"}]
+   | 
+error: Native type Timestamp is not supported for sqlite connector.
+  -->  prisma-sqlite/jackson.prisma:20
+   | 
+19 |   namespace  String?
+20 |   createdAt  DateTime  @default(now()) @db.Timestamp(0)
+   | 
+error: Native type Timestamp is not supported for sqlite connector.
+  -->  prisma-sqlite/jackson.prisma:21
+   | 
+20 |   createdAt  DateTime  @default(now()) @db.Timestamp(0)
+21 |   modifiedAt DateTime? @db.Timestamp(0)
+   | 
+error: Field "allowList" in model "Link" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/link.prisma:25
+   | 
+24 |   password                   String? // Optional password for link protection
+25 |   allowList                  String[] // Array of emails and domains allowed to view the document
+26 |   denyList                   String[] // Array of emails and domains denied to view the document
+   | 
+error: Field "denyList" in model "Link" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/link.prisma:26
+   | 
+25 |   allowList                  String[] // Array of emails and domains allowed to view the document
+26 |   denyList                   String[] // Array of emails and domains denied to view the document
+27 |   emailProtected             Boolean    @default(true) // Optional email protection
+   | 
+error: Field "allowList" in model "LinkPreset" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/link.prisma:132
+   | 
+131 |   enableAllowList            Boolean?  @default(false)
+132 |   allowList                  String[]
+133 |   enableDenyList             Boolean?  @default(false)
+   | 
+error: Field "denyList" in model "LinkPreset" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/link.prisma:134
+   | 
+133 |   enableDenyList             Boolean?  @default(false)
+134 |   denyList                   String[]
+135 |   expiresIn                  Int? // how many days from link creation until it expires in seconds
+   | 
+error: Field "emails" in model "VisitorGroup" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/link.prisma:175
+   | 
+174 |   name   String
+175 |   emails String[] // List of emails and domains (e.g., "user@example.com", "@example.org")
+176 | 
+   | 
+error: Native type Text is not supported for sqlite connector.
+  -->  prisma-sqlite/models_from_schema.prisma:9
+   | 
+ 8 |   providerAccountId String
+ 9 |   refresh_token     String? @db.Text
+   | 
+error: Native type Text is not supported for sqlite connector.
+  -->  prisma-sqlite/models_from_schema.prisma:10
+   | 
+ 9 |   refresh_token     String? @db.Text
+10 |   access_token      String? @db.Text
+   | 
+error: Native type Text is not supported for sqlite connector.
+  -->  prisma-sqlite/models_from_schema.prisma:14
+   | 
+13 |   scope             String?
+14 |   id_token          String? @db.Text
+   | 
+error: Native type Text is not supported for sqlite connector.
+  -->  prisma-sqlite/models_from_schema.prisma:300
+   | 
+299 |   role    String // "user" | "assistant" | "system"
+300 |   content String @db.Text
+   | 
+error: Field "ignoredDomains" in model "Team" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/team.prisma:68
+   | 
+67 | 
+68 |   ignoredDomains  String[] // Domains that are ignored for the team
+69 |   globalBlockList String[] // Email and domains that are blocked for the team
+   | 
+error: Field "globalBlockList" in model "Team" can't be a list. The current connector does not support lists of primitive types.
+  -->  prisma-sqlite/team.prisma:69
+   | 
+68 |   ignoredDomains  String[] // Domains that are ignored for the team
+69 |   globalBlockList String[] // Email and domains that are blocked for the team
+70 | }
+   | 
+
+

@@ -1,0 +1,52 @@
+# Hanzo SQL — PRIMARY path: a Prisma app on file:SQLite via the `Service` Kind's
+# `persistence` block. This is how our own services get durable per-tenant SQL
+# with zero pg-wire hop. It is the pattern the `esign` (Documenso) Service already
+# runs in production (DATABASE_URL=file:/data/sign.db, prisma sqlite provider).
+#
+# `persistence` auto-wires: a durable `app-db` volume, a `replicate-restore`
+# initContainer, and a `hanzoai/replicate` sidecar that streams the SQLite WAL to
+# SeaweedFS/S3, age-encrypted client-side. `dir_mode` fans a single volume into
+# many .db files (per-tenant / per-org) — the "one PVC, many files" layout.
+#
+# A consuming Prisma app takes TWO code changes to adopt this (see ../LLM.md):
+#   1. datasource provider "postgresql" -> "sqlite"; url env("DATABASE_URL")=file:...
+#   2. drop scalar arrays (-> String holding JSON) and pg @db.* native types.
+# Existing data is moved once with the pg->SQLite ETL (see ../etl/).
+apiVersion: hanzo.ai/v1
+kind: Service
+metadata:
+  name: esign
+  namespace: hanzo
+spec:
+  image:
+    repository: ghcr.io/hanzoai/esign
+    tag: "2.7.1"              # semver only
+    pullPolicy: IfNotPresent
+  replicas: 1                 # single-writer SQLite file; scale reads via replicas of the WAL, not >1 writer
+  env:
+    - name: DATABASE_URL
+      value: file:/data/sign.db
+  # Run the Prisma migration before the app boots; the app opens an already-migrated file.
+  initContainers:
+    - name: migrate
+      command: ["npx", "prisma", "migrate", "deploy"]
+  ports:
+    - name: http
+      containerPort: 3000
+      servicePort: 80
+  fsGroup: 65532              # DO block PVC is root-owned; nonroot app needs this to write /data
+  # `persistence` = the operator's SQLite-durability block (PersistenceSpec).
+  persistence:
+    mountPath: /data
+    size: 10Gi
+    storageClassName: do-block-storage
+    # WAL -> S3, age-encrypted (backup + point-in-time restore on restart).
+    bucket: esign-db
+    s3Path: esign/sign
+    s3CredentialsSecret: s3-credentials
+    ageSecret: base-replicate-age
+    # dirMode fans the volume into many per-tenant .db files instead of one.
+    # dirMode: true
+  imagePullSecrets:
+    - name: ghcr-secret
+  partOf: apps
