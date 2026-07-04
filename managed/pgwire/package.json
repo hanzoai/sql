@@ -1,0 +1,21 @@
+{
+  "name": "@hanzo/sql-managed",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hanzo SQL — pg-wire endpoint over embedded Postgres (pglite), one tenant per process",
+  "bin": {
+    "hanzo-sql": "./server.mjs",
+    "hanzo-sql-provision": "./provision.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.4",
+    "@electric-sql/pglite-socket": "0.2.7"
+  }
+}
