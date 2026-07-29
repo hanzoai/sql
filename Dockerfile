@@ -145,6 +145,13 @@ COPY docker-entrypoint-initdb.d/ /docker-entrypoint-initdb.d/
 # Our names on the outside, upstream's on the inside — see entrypoint.sh.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# `sqld` is the daemon, matching luxd / hanzod / zood / kvd — the fleet names a
+# long-running server <thing>d. A SYMLINK rather than a rename: the server
+# re-execs itself by path and the extensions resolve against the upstream name,
+# so pointing a Hanzo name at it is the rename that is safe to make in the
+# image. Renaming the binary is a change to the fork's build, not its packaging.
+RUN ln -sf /usr/lib/postgresql/${PG_MAJOR}/bin/postgres /usr/local/bin/sqld
+
 # Health check
 HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
     CMD pg_isready -U "${SQL_USER:?}" || exit 1
@@ -152,5 +159,5 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
 EXPOSE 5432
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+CMD ["sqld", "-c", "config_file=/etc/postgresql/postgresql.conf"]
 
