@@ -147,7 +147,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Health check
 HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
-    CMD pg_isready -U "${SQL_USER:-${POSTGRES_USER:-hanzo}}" || exit 1
+    CMD pg_isready -U "${SQL_USER:?}" || exit 1
 
 EXPOSE 5432
 
