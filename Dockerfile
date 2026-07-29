@@ -142,11 +142,15 @@ COPY conf/postgresql.conf /etc/postgresql/postgresql.conf
 # Init scripts: enable extensions on startup
 COPY docker-entrypoint-initdb.d/ /docker-entrypoint-initdb.d/
 
+# Our names on the outside, upstream's on the inside — see entrypoint.sh.
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
 # Health check
 HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
-    CMD pg_isready -U "${POSTGRES_USER:-postgres}" || exit 1
+    CMD pg_isready -U "${SQL_USER:?}" || exit 1
 
 EXPOSE 5432
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
 
