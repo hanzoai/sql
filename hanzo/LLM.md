@@ -40,12 +40,12 @@ Console uses PostgreSQL for metadata:
 DATABASE_URL=postgresql://hanzo:password@localhost:5432/hanzo
 ```
 
-### With hanzo/iam (Casdoor fork)
+### With hanzo/iam
 
-IAM stores user/org data:
-```env
-driverName=postgres
-dataSourceName=host=localhost port=5432 user=hanzo password=password dbname=hanzo
+IAM stores user/org data. The store backend is chosen by flag, and `sql`
+reaches this server over ZAP (`:9651`), not a libpq DSN:
+```bash
+iam --store sql   # sqlite | sql | datastore
 ```
 
 ### With hanzo/base (PocketBase fork)
