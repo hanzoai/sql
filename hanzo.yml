@@ -1,0 +1,13 @@
+# ghcr.io/hanzoai/sql — PostgreSQL 18 with pgvector, pg_cron, pg_documentdb and
+# this repo's own contrib/zap_fdw. The Dockerfile IS the gate: it compiles
+# zap_fdw from this tree and bakes conf/ and docker-entrypoint-initdb.d/, so a
+# break in any of them fails the build. That is also exactly the path
+# .github/workflows/deploy.yml filters on, and it is a full extension toolchain
+# build (libbson, Intel decimal math, pcre2, documentdb) — slow by nature.
+#
+# No deploy:. universe pins the live tag.
+images:
+  - name: sql
+    context: .
+    dockerfile: Dockerfile
+    repo: ghcr.io/hanzoai/sql
