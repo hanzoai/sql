@@ -5,7 +5,17 @@
 # .github/workflows/deploy.yml filters on, and it is a full extension toolchain
 # build (libbson, Intel decimal math, pcre2, documentdb) — slow by nature.
 #
+# version: is required here and cannot be derived. imgver reads a repo's own
+# manifest, and this tree has none it recognises — no package.json, Cargo.toml,
+# VERSION or pyproject.toml — so the first run died with "no version for
+# ghcr.io/hanzoai/sql. We don't ship shas." It tracks PG_MAJOR, which is what
+# the image actually ships: the runtime stage is FROM postgres:18-bookworm.
+# NOT configure.ac's 19beta1 — that is the vendored PostgreSQL source fork,
+# which this image does not build and does not run. imgver takes
+# max(declared, published) + a patch, so the series moves on its own from here.
+#
 # No deploy:. universe pins the live tag.
+version: 18.0.0
 images:
   - name: sql
     context: .
