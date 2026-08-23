@@ -11,8 +11,6 @@
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "lib/stringinfo.h"
-#include "access/xact.h"
-#include "utils/snapmgr.h"
 #include "zap_protocol.h"
 
 /*
@@ -30,10 +28,7 @@ zap_execute_query(const char *sql, int sql_len)
 
     initStringInfo(&buf);
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
     SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
 
     ret = SPI_execute(sql, true /* read-only */, 0 /* no limit */);
 
@@ -46,14 +41,10 @@ zap_execute_query(const char *sql, int sql_len)
             appendStringInfo(&buf, "{\"affected\":%lu}",
                            (unsigned long)SPI_processed);
             SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
             return buf.data;
         }
 
         SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
         appendStringInfo(&buf, "{\"error\":\"SPI error: %d\"}", ret);
         return buf.data;
     }
@@ -111,8 +102,6 @@ zap_execute_query(const char *sql, int sql_len)
     appendStringInfoChar(&buf, ']');
 
     SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
 
     return buf.data;
 }
@@ -129,18 +118,13 @@ zap_execute_statement(const char *sql, int sql_len)
 
     initStringInfo(&buf);
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
     SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
 
     ret = SPI_execute(sql, false /* read-write */, 0);
 
     if (ret < 0)
     {
         SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
         appendStringInfo(&buf, "{\"error\":\"SPI error: %d\"}", ret);
         return buf.data;
     }
@@ -149,8 +133,6 @@ zap_execute_statement(const char *sql, int sql_len)
                    (unsigned long)SPI_processed);
 
     SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
 
     return buf.data;
 }
