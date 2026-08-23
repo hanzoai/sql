@@ -16,6 +16,8 @@
 #include "storage/proc.h"
 #include "utils/guc.h"
 #include "tcop/utility.h"
+#include "access/xact.h"
+#include "utils/snapmgr.h"
 
 #include <signal.h>
 #include <sys/socket.h>
@@ -296,8 +298,13 @@ zap_worker_main(Datum main_arg)
     elog(LOG, "zap: connecting to database \"%s\"", dbname);
     BackgroundWorkerInitializeConnection(dbname, NULL, 0);
 
-    /* Ensure KV table exists */
+    /* Ensure KV table exists (inside a transaction with an active snapshot) */
+    SetCurrentStatementStartTimestamp();
+    StartTransactionCommand();
+    PushActiveSnapshot(GetTransactionSnapshot());
     zap_kv_ensure_table();
+    PopActiveSnapshot();
+    CommitTransactionCommand();
 
     /* Create TCP socket. PG 18 elog() macro plants a local `__errno_location`
      * via pg_prevent_errno_in_scope, shadowing glibc's function and breaking
@@ -359,7 +366,16 @@ zap_worker_main(Datum main_arg)
         /* Read ZAP message */
         n = recv(client_fd, buf, sizeof(buf), 0);
         if (n > 0)
+        {
+            /* One transaction + snapshot per request; the reply is sent inside
+             * handle_zap_message, before the commit frees its memory. */
+            SetCurrentStatementStartTimestamp();
+            StartTransactionCommand();
+            PushActiveSnapshot(GetTransactionSnapshot());
             handle_zap_message(client_fd, buf, (size_t)n);
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+        }
 
         close(client_fd);
     }
