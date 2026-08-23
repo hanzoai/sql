@@ -18,8 +18,10 @@
 #include "tcop/utility.h"
 #include "access/xact.h"
 #include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -344,20 +346,41 @@ zap_worker_main(Datum main_arg)
         return;
     }
 
+    /* Non-blocking so accept() never parks the worker across a shutdown signal. */
+    if (fcntl(server_fd, F_SETFL, O_NONBLOCK) < 0)
+    {
+        int saved_errno = errno;
+        elog(ERROR, "zap: fcntl(O_NONBLOCK) failed: %s", strerror(saved_errno));
+        close(server_fd);
+        return;
+    }
+
     elog(LOG, "zap: listening on port %d", zap_port);
 
-    /* Main accept loop */
+    /* Wait on the process latch OR an incoming connection: SIGTERM sets the latch
+     * (see zap_sigterm_handler), so a fast shutdown wakes us at once and the
+     * server can stop — a blocking accept() would ignore it under SA_RESTART. */
     while (!got_sigterm)
     {
         int client_fd;
         uint8_t buf[65536];
         ssize_t n;
+        int rc;
+
+        rc = WaitLatchOrSocket(MyLatch,
+                               WL_LATCH_SET | WL_SOCKET_READABLE | WL_EXIT_ON_PM_DEATH,
+                               server_fd, -1L, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        if (got_sigterm)
+            break;
+        if (!(rc & WL_SOCKET_READABLE))
+            continue;
 
         client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0)
         {
             int saved_errno = errno;
-            if (saved_errno == EINTR)
+            if (saved_errno == EINTR || saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)
                 continue;
             elog(WARNING, "zap: accept() failed: %s", strerror(saved_errno));
             continue;
