@@ -36,4 +36,8 @@ optional SQL_DATA      PGDATA
 optional SQL_HOST_AUTH_METHOD POSTGRES_HOST_AUTH_METHOD
 optional SQL_INITDB_ARGS      POSTGRES_INITDB_ARGS
 
+# docker-entrypoint.sh only runs its initdb+gosu+setup path when the server is
+# named `postgres`; `sqld` is our branded symlink to it. Translate so a fresh or
+# existing cluster is set up and the server drops to the unprivileged user.
+if [ "$1" = "sqld" ]; then shift; set -- postgres "$@"; fi
 exec docker-entrypoint.sh "$@"
