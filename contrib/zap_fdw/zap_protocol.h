@@ -1,176 +1,130 @@
 /*
- * zap_protocol.h — ZAP binary protocol constants and helpers for hanzo/sql.
+ * zap_protocol.h — canonical ZAP-HTTP wire codec for hanzo/sql.
  *
- * ZAP (Zero-copy Application Protocol) wire format:
- *   Header (16 bytes):
- *     [0-3]   Magic: "ZAP\0"
- *     [4-5]   Version: uint16 LE (currently 1)
- *     [6-7]   Flags: uint16 LE (message type)
- *     [8-11]  Root offset: uint32 LE
- *     [12-15] Size: uint32 LE
- *   Data segment: objects with typed fields at byte offsets
+ * Implements the transport and frame codec of github.com/zap-proto/http
+ * (transport.go, codec.go, wire.go), the one internal transport the ORM,
+ * gateway, and ingress speak. hanzo/sql answers it natively so a client using
+ * hanzoai/orm's ZAP driver talks to Postgres with no sidecar.
+ *
+ * Transport: each message is one length-prefixed frame — a 4-byte BIG-ENDIAN
+ * length N followed by N frame bytes.
+ *
+ * Frame: a zap-proto/go message — a 16-byte header then a root object.
+ *   header: [0:4] "ZAP\0"  [4:6] version u16 LE  [6:8] flags u16 LE
+ *           [8:12] rootOffset u32 LE (=16)  [12:16] size u32 LE (= frame length)
+ *   type = flags >> 8 (request=1, response=2).
+ *   root object: a fixed 48-byte section of 8-byte {relOffset u32 LE, length u32
+ *   LE} slots; a non-empty field's bytes sit in the variable tail at
+ *   slot+relOffset, an empty field is a zeroed {0,0} slot.
  */
 #ifndef ZAP_PROTOCOL_H
 #define ZAP_PROTOCOL_H
 
 #include <stdint.h>
 #include <string.h>
-#include <stdlib.h>
 #include <stdbool.h>
 
-#define ZAP_MAGIC       "ZAP\0"
-#define ZAP_MAGIC_LEN   4
-#define ZAP_VERSION     1
-#define ZAP_HEADER_SIZE 16
+#define ZAP_MAGIC        "ZAP\0"
+#define ZAP_HEADER_SIZE  16
+#define ZAP_ROOT_OFFSET  16
 
-/* Message type IDs (matching hanzo/orm constants) */
-#define ZAP_MSG_SQL        300
-#define ZAP_MSG_KV         301
-#define ZAP_MSG_DATASTORE  302
-#define ZAP_MSG_DOCUMENTDB 303
+/* frame type (flags >> 8) */
+#define ZAP_FRAME_REQUEST  1
+#define ZAP_FRAME_RESPONSE 2
 
-/* Field offsets in ZAP objects */
-#define ZAP_FIELD_PATH     4   /* Text: request path */
-#define ZAP_FIELD_BODY     12  /* Bytes: JSON body */
-#define ZAP_RESP_STATUS    0   /* Uint32: HTTP-style status */
-#define ZAP_RESP_BODY      4   /* Bytes: response JSON */
+/* request root object slots */
+#define ZAP_REQ_METHOD   0
+#define ZAP_REQ_TARGET   8
+#define ZAP_REQ_PROTO    16
+#define ZAP_REQ_HEADERS  24
+#define ZAP_REQ_BODY     32
+#define ZAP_REQ_TRAILER  40
+#define ZAP_REQ_SLOTSIZE 48
 
-/* Little-endian read helpers */
-static inline uint16_t zap_read_u16(const uint8_t *buf) {
-    return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+/* response root object slots */
+#define ZAP_RESP_STATUS   0   /* u16 scalar */
+#define ZAP_RESP_REASON   8
+#define ZAP_RESP_PROTO    16
+#define ZAP_RESP_HEADERS  24
+#define ZAP_RESP_BODY     32
+#define ZAP_RESP_TRAILER  40
+#define ZAP_RESP_SLOTSIZE 48
+
+/* little-endian scalars (frame body) */
+static inline uint16_t zap_rd_u16(const uint8_t *b) {
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+static inline uint32_t zap_rd_u32(const uint8_t *b) {
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static inline void zap_wr_u16(uint8_t *b, uint16_t v) {
+    b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
+}
+static inline void zap_wr_u32(uint8_t *b, uint32_t v) {
+    b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
+    b[2] = (v >> 16) & 0xFF; b[3] = (v >> 24) & 0xFF;
 }
 
-static inline uint32_t zap_read_u32(const uint8_t *buf) {
-    return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
-           ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+/* big-endian length prefix (transport) */
+static inline uint32_t zap_rd_u32be(const uint8_t *b) {
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8) | (uint32_t)b[3];
 }
-
-static inline void zap_write_u16(uint8_t *buf, uint16_t val) {
-    buf[0] = val & 0xFF;
-    buf[1] = (val >> 8) & 0xFF;
-}
-
-static inline void zap_write_u32(uint8_t *buf, uint32_t val) {
-    buf[0] = val & 0xFF;
-    buf[1] = (val >> 8) & 0xFF;
-    buf[2] = (val >> 16) & 0xFF;
-    buf[3] = (val >> 24) & 0xFF;
-}
-
-/* ZAP header structure */
-typedef struct {
-    uint16_t version;
-    uint16_t flags;
-    uint32_t root_offset;
-    uint32_t size;
-    uint16_t msg_type;  /* extracted from flags */
-} ZapHeader;
-
-/* Parse a ZAP header. Returns true on success. */
-static inline bool zap_parse_header(const uint8_t *data, size_t len, ZapHeader *hdr) {
-    if (len < ZAP_HEADER_SIZE)
-        return false;
-    if (memcmp(data, ZAP_MAGIC, ZAP_MAGIC_LEN) != 0)
-        return false;
-
-    hdr->version = zap_read_u16(data + 4);
-    if (hdr->version != ZAP_VERSION)
-        return false;
-
-    hdr->flags = zap_read_u16(data + 6);
-    hdr->root_offset = zap_read_u32(data + 8);
-    hdr->size = zap_read_u32(data + 12);
-    hdr->msg_type = hdr->flags;
-
-    if (hdr->size > len)
-        return false;
-
-    return true;
+static inline void zap_wr_u32be(uint8_t *b, uint32_t v) {
+    b[0] = (v >> 24) & 0xFF; b[1] = (v >> 16) & 0xFF;
+    b[2] = (v >> 8) & 0xFF; b[3] = v & 0xFF;
 }
 
 /*
- * Read a Text field from a ZAP object.
- * Text is stored as: relative_offset (i32) + length (u32) at field_offset.
- * Returns pointer into original buffer (zero-copy). Sets *out_len.
+ * Validate a frame's header and return the root object offset and frame size.
+ * Returns 0 on success, -1 if the frame is malformed or not want_type.
  */
-static inline const char *zap_read_text(const uint8_t *data, size_t data_len,
-                                         uint32_t obj_offset, int field_offset,
-                                         uint32_t *out_len) {
-    uint32_t pos = obj_offset + field_offset;
-    if (pos + 8 > data_len) {
-        *out_len = 0;
-        return NULL;
-    }
+static inline int zap_frame_root(const uint8_t *f, uint32_t flen, int want_type,
+                                 uint32_t *root_out, uint32_t *size_out) {
+    uint16_t ver, type;
+    uint32_t size, root;
 
-    int32_t rel_offset = (int32_t)zap_read_u32(data + pos);
-    if (rel_offset == 0) {
-        *out_len = 0;
-        return NULL;
-    }
+    if (flen < ZAP_HEADER_SIZE)
+        return -1;
+    if (memcmp(f, ZAP_MAGIC, 4) != 0)
+        return -1;
+    ver = zap_rd_u16(f + 4);
+    if (ver != 1 && ver != 2)
+        return -1;
+    size = zap_rd_u32(f + 12);
+    if (size < ZAP_HEADER_SIZE || size > flen)
+        return -1;
+    type = zap_rd_u16(f + 6) >> 8;
+    if (type != (uint16_t)want_type)
+        return -1;
+    root = zap_rd_u32(f + 8);
+    if (root < ZAP_HEADER_SIZE || root >= size)
+        return -1;
 
-    uint32_t length = zap_read_u32(data + pos + 4);
-    uint32_t abs_pos = pos + rel_offset;
-
-    if (abs_pos + length > data_len) {
-        *out_len = 0;
-        return NULL;
-    }
-
-    *out_len = length;
-    return (const char *)(data + abs_pos);
+    *root_out = root;
+    *size_out = size;
+    return 0;
 }
 
 /*
- * Read a Bytes field from a ZAP object (same layout as Text).
+ * Read a text/bytes field at a root object slot, zero-copy. Returns a pointer
+ * into f and sets *len_out, or NULL for a null/out-of-range field.
  */
-static inline const uint8_t *zap_read_bytes(const uint8_t *data, size_t data_len,
-                                              uint32_t obj_offset, int field_offset,
-                                              uint32_t *out_len) {
-    return (const uint8_t *)zap_read_text(data, data_len, obj_offset, field_offset, out_len);
-}
+static inline const uint8_t *zap_read_var(const uint8_t *f, uint32_t size,
+                                          uint32_t root, int field_off,
+                                          uint32_t *len_out) {
+    uint32_t slot = root + field_off, rel, len, abs;
 
-/*
- * Build a ZAP response message.
- * Caller must free() the returned buffer.
- */
-static inline uint8_t *zap_build_response(uint32_t status, const uint8_t *body,
-                                            uint32_t body_len, uint32_t *out_size) {
-    /* Layout: header(16) + root_object(20) + body_data */
-    uint32_t total = ZAP_HEADER_SIZE + 20 + body_len;
-    /* Align to 8 bytes */
-    total = (total + 7) & ~7;
+    if (slot + 8 > size) { *len_out = 0; return NULL; }
+    rel = zap_rd_u32(f + slot);
+    if (rel == 0) { *len_out = 0; return NULL; }
+    len = zap_rd_u32(f + slot + 4);
+    abs = slot + rel;
+    if (abs < ZAP_HEADER_SIZE || abs + len > size) { *len_out = 0; return NULL; }
 
-    uint8_t *buf = (uint8_t *)calloc(1, total);
-    if (!buf) {
-        *out_size = 0;
-        return NULL;
-    }
-
-    /* Header */
-    memcpy(buf, ZAP_MAGIC, ZAP_MAGIC_LEN);
-    zap_write_u16(buf + 4, ZAP_VERSION);
-    zap_write_u16(buf + 6, 0);  /* flags */
-    zap_write_u32(buf + 8, ZAP_HEADER_SIZE);  /* root at offset 16 */
-    zap_write_u32(buf + 12, total);
-
-    /* Root object at offset 16 */
-    uint32_t root = ZAP_HEADER_SIZE;
-
-    /* Field 0: status (uint32) */
-    zap_write_u32(buf + root + ZAP_RESP_STATUS, status);
-
-    /* Field 4: body (bytes) — relative offset + length */
-    uint32_t body_offset = 20;  /* relative from field position to body data */
-    int32_t rel = (int32_t)(body_offset - ZAP_RESP_BODY);
-    zap_write_u32(buf + root + ZAP_RESP_BODY, (uint32_t)rel);
-    zap_write_u32(buf + root + ZAP_RESP_BODY + 4, body_len);
-
-    /* Body data at root + 20 */
-    if (body && body_len > 0)
-        memcpy(buf + root + 20, body, body_len);
-
-    *out_size = total;
-    return buf;
+    *len_out = len;
+    return f + abs;
 }
 
 #endif /* ZAP_PROTOCOL_H */
