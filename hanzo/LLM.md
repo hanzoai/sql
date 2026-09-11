@@ -48,7 +48,7 @@ reaches this server over ZAP (`:9651`), not a libpq DSN:
 iam --store sql   # sqlite | sql | datastore
 ```
 
-### With hanzo/base (PocketBase fork)
+### With hanzo/base
 
 Base instances use embedded SQLite, but orchestration metadata in PostgreSQL.
 
