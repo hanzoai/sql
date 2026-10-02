@@ -145,6 +145,19 @@ COPY docker-entrypoint-initdb.d/ /docker-entrypoint-initdb.d/
 # Our names on the outside, upstream's on the inside — see entrypoint.sh.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# sqlha runs a member of a replicated cluster under Patroni: a leader lease in the
+# Kubernetes API, streaming replication, and promotion when the leader is gone.
+# A single sql runs sqld as before; see sqlha.sh.
+ARG PATRONI_VERSION=4.1.5
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-psycopg2 \
+    && python3 -m venv --system-site-packages /opt/patroni \
+    && /opt/patroni/bin/pip install --no-cache-dir "patroni==${PATRONI_VERSION}" \
+    && ln -s /opt/patroni/bin/patroni /usr/local/bin/patroni \
+    && ln -s /opt/patroni/bin/patronictl /usr/local/bin/patronictl \
+    && rm -rf /var/lib/apt/lists/*
+COPY sqlha.sh /usr/local/bin/sqlha
+
 # `sqld` is the daemon, matching luxd / hanzod / zood / kvd — the fleet names a
 # long-running server <thing>d. A SYMLINK rather than a rename: the server
 # re-execs itself by path and the extensions resolve against the upstream name,
