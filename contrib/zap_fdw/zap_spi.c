@@ -7,19 +7,21 @@
  * the caller casting. /query returns the rows as a JSON array of objects;
  * /exec returns the affected-row count.
  *
- * The caller (zap_listener) opens a transaction with an active snapshot around
- * each request, so these run plain SPI.
+ * The caller (zap_listener) runs each request inside a transaction with an
+ * active snapshot — its own, or the client's open one — so these run plain SPI.
+ * Any statement may write: an INSERT ... RETURNING is a /query.
  */
 #include "postgres.h"
 #include "fmgr.h"
 #include "executor/spi.h"
 #include "utils/builtins.h"
 #include "lib/stringinfo.h"
-#include "catalog/pg_type_d.h"   /* UNKNOWNOID */
+#include "catalog/pg_type_d.h"   /* type OIDs */
 
 char *zap_sql_query(const char *body, int body_len, uint32_t *status);
 char *zap_sql_exec(const char *body, int body_len, uint32_t *status);
 void zap_ensure_tables(void);
+void zap_append_json_string(StringInfo buf, const char *s);
 
 /* ---- minimal JSON reader for {"sql": "...", "args": ["...", ...]} ---- */
 
@@ -270,25 +272,69 @@ run_sql(const char *sql, char **args, bool *argnull, int nargs, bool read_only)
     return SPI_execute_with_args(sql, nargs, types, vals, nulls, read_only, 0);
 }
 
-/* Append one SPI result value as JSON: a JSON scalar/object emitted verbatim,
- * anything else quoted as a string. */
+/* Append s as a JSON string: quoted, with quotes, backslashes and control
+ * characters escaped. */
+void
+zap_append_json_string(StringInfo buf, const char *s)
+{
+    appendStringInfoChar(buf, '"');
+    for (; *s; s++)
+    {
+        unsigned char c = (unsigned char) *s;
+
+        switch (c)
+        {
+            case '"':  appendStringInfoString(buf, "\\\""); break;
+            case '\\': appendStringInfoString(buf, "\\\\"); break;
+            case '\n': appendStringInfoString(buf, "\\n"); break;
+            case '\r': appendStringInfoString(buf, "\\r"); break;
+            case '\t': appendStringInfoString(buf, "\\t"); break;
+            default:
+                if (c < 0x20)
+                    appendStringInfo(buf, "\\u%04x", c);
+                else
+                    appendStringInfoChar(buf, (char) c);
+        }
+    }
+    appendStringInfoChar(buf, '"');
+}
+
+/* Append one SPI result value as JSON by its column type: json and jsonb as the
+ * document they hold, a boolean as true or false, a number as its digits, and
+ * everything else as a string. Guessing from the text cannot work: an id that
+ * begins with a digit is not a number, and a string may contain a quote. */
 static void
-append_value(StringInfo buf, char *value)
+append_value(StringInfo buf, char *value, Oid type)
 {
     if (value == NULL)
     {
         appendStringInfoString(buf, "null");
         return;
     }
-    if (value[0] == '{' || value[0] == '[' || value[0] == '"' ||
-        strcmp(value, "true") == 0 || strcmp(value, "false") == 0 ||
-        (value[0] >= '0' && value[0] <= '9') || value[0] == '-')
-        appendStringInfoString(buf, value);
-    else
+    switch (type)
     {
-        appendStringInfoChar(buf, '"');
-        appendStringInfoString(buf, value);
-        appendStringInfoChar(buf, '"');
+        case JSONOID:
+        case JSONBOID:
+            appendStringInfoString(buf, value);
+            break;
+        case BOOLOID:
+            appendStringInfoString(buf, value[0] == 't' ? "true" : "false");
+            break;
+        case INT2OID:
+        case INT4OID:
+        case INT8OID:
+        case OIDOID:
+        case NUMERICOID:
+        case FLOAT4OID:
+        case FLOAT8OID:
+            if (strcmp(value, "NaN") == 0 || strcmp(value, "Infinity") == 0 ||
+                strcmp(value, "-Infinity") == 0)
+                zap_append_json_string(buf, value);
+            else
+                appendStringInfoString(buf, value);
+            break;
+        default:
+            zap_append_json_string(buf, value);
     }
 }
 
@@ -317,7 +363,7 @@ zap_sql_query(const char *body, int body_len, uint32_t *status)
     }
 
     SPI_connect();
-    ret = run_sql(sql, args, argnull, nargs, true);
+    ret = run_sql(sql, args, argnull, nargs, false);
     if (ret < 0)
     {
         SPI_finish();
@@ -339,8 +385,9 @@ zap_sql_query(const char *body, int body_len, uint32_t *status)
             char *value = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, j + 1);
             if (j > 0)
                 appendStringInfoChar(&buf, ',');
-            appendStringInfo(&buf, "\"%s\":", colname);
-            append_value(&buf, value);
+            zap_append_json_string(&buf, colname);
+            appendStringInfoChar(&buf, ':');
+            append_value(&buf, value, SPI_gettypeid(SPI_tuptable->tupdesc, j + 1));
         }
         appendStringInfoChar(&buf, '}');
     }
@@ -394,9 +441,14 @@ zap_sql_exec(const char *body, int body_len, uint32_t *status)
 /*
  * Provision the tables the ORM's ZAP SQL and KV backends expect: a single
  * _entities store keyed by id (kind distinguishes rows, data holds the entity
- * JSON) and the _zap_kv store. A transaction advisory lock serializes workers so
- * concurrent CREATE IF NOT EXISTS can't race on the type catalog. Runs inside
- * the caller's transaction.
+ * as jsonb, which is what the ORM reads fields of with ->> and indexes) and the
+ * _zap_kv store. A transaction advisory lock serializes workers so concurrent
+ * CREATE IF NOT EXISTS can't race on the type catalog. Runs inside the caller's
+ * transaction.
+ *
+ * A table an earlier version created with text columns is converted in place:
+ * data to jsonb, the two timestamps to timestamptz. An empty value, the old
+ * columns' default, becomes an empty document or the epoch.
  */
 void
 zap_ensure_tables(void)
@@ -407,10 +459,26 @@ zap_ensure_tables(void)
         "CREATE TABLE IF NOT EXISTS _entities ("
         "id text PRIMARY KEY, "
         "kind text NOT NULL DEFAULT '', "
-        "data text NOT NULL DEFAULT '', "
-        "created_at text NOT NULL DEFAULT '', "
-        "updated_at text NOT NULL DEFAULT '', "
+        "data jsonb NOT NULL DEFAULT '{}'::jsonb, "
+        "created_at timestamptz NOT NULL DEFAULT now(), "
+        "updated_at timestamptz NOT NULL DEFAULT now(), "
         "deleted boolean NOT NULL DEFAULT false)", false, 0);
+    SPI_execute(
+        "DO $do$ BEGIN "
+        "IF (SELECT data_type FROM information_schema.columns "
+        "    WHERE table_schema = current_schema() AND table_name = '_entities' AND column_name = 'data') = 'text' THEN "
+        "  ALTER TABLE _entities ALTER COLUMN data DROP DEFAULT; "
+        "  ALTER TABLE _entities ALTER COLUMN data TYPE jsonb USING (CASE WHEN data = '' THEN '{}' ELSE data END)::jsonb; "
+        "  ALTER TABLE _entities ALTER COLUMN data SET DEFAULT '{}'::jsonb; "
+        "END IF; "
+        "IF (SELECT data_type FROM information_schema.columns "
+        "    WHERE table_schema = current_schema() AND table_name = '_entities' AND column_name = 'created_at') = 'text' THEN "
+        "  ALTER TABLE _entities ALTER COLUMN created_at DROP DEFAULT, ALTER COLUMN updated_at DROP DEFAULT; "
+        "  ALTER TABLE _entities "
+        "    ALTER COLUMN created_at TYPE timestamptz USING (CASE WHEN created_at = '' THEN 'epoch' ELSE created_at END)::timestamptz, "
+        "    ALTER COLUMN updated_at TYPE timestamptz USING (CASE WHEN updated_at = '' THEN 'epoch' ELSE updated_at END)::timestamptz; "
+        "  ALTER TABLE _entities ALTER COLUMN created_at SET DEFAULT now(), ALTER COLUMN updated_at SET DEFAULT now(); "
+        "END IF; END $do$", false, 0);
     SPI_execute("CREATE INDEX IF NOT EXISTS _entities_kind ON _entities (kind)", false, 0);
     SPI_execute(
         "CREATE TABLE IF NOT EXISTS _zap_kv ("
@@ -420,15 +488,5 @@ zap_ensure_tables(void)
         "deleted boolean NOT NULL DEFAULT false, "
         "created_at timestamptz NOT NULL DEFAULT now(), "
         "updated_at timestamptz NOT NULL DEFAULT now())", false, 0);
-    /*
-     * The ORM's ZAP backend addresses entity fields with SQLite's
-     * json_extract(data, '$.a.b'); provide it over jsonb so the one dialect
-     * runs unchanged on Postgres. Returns the value as text, matching SQLite.
-     */
-    SPI_execute(
-        "CREATE OR REPLACE FUNCTION json_extract(j text, path text) RETURNS text "
-        "LANGUAGE sql IMMUTABLE AS $fn$ "
-        "SELECT CASE WHEN j IS NULL OR j = '' THEN NULL "
-        "ELSE (j::jsonb #>> string_to_array(ltrim(path, '$.'), '.')) END $fn$", false, 0);
     SPI_finish();
 }
