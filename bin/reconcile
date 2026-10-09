@@ -1,0 +1,546 @@
+#!/opt/patroni/bin/python3
+"""reconcile: make a sql cluster equal to its declared file.
+
+A container of the sql pod beside sqlha, from the same image. It acts only on
+the leader (pg_is_in_recovery() false), over the local socket, and does nothing
+on a standby. Each pass reads the declared file and, in this order:
+
+  1. creates roles LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS with no password,
+     CREATEDB / CREATEROLE only where declared, and sets synchronous_commit=on
+     on each;
+  2. adds every OAuth role to the group sql_iam;
+  3. runs CREATE DATABASE ... OWNER for each declared database, revokes CONNECT
+     from PUBLIC on it, and grants CONNECT to the roles that list it;
+  4. adopts an existing database: ALTER OWNER on each object its `adopt` role
+     owns, never REASSIGN OWNED BY (which would take every database that role
+     owns, shared objects included), then lists what the role still owns there
+     and reports each object, since a foreign-data wrapper, an event trigger and
+     a subscription cannot belong to a role that is not a superuser;
+  5. asserts rolpassword IS NULL for every member of sql_iam, and reports each
+     role that has one;
+  6. PATCHes the declared Patroni config (the DCS block) through the local
+     REST API until the DCS equals it;
+  7. reloads pg_hba when the hash of its declared lines changes.
+
+The reconciler sets no password and drops nothing: a role or database it no
+longer declares is left alone, and a pass alters no role the file does not name.
+Every statement it sends, reads included, is logged with the database it ran in.
+A statement waits at most LOCK_TIMEOUT for a lock and runs at most
+STATEMENT_TIMEOUT, so a session holding a lock fails one step with a reported
+error and the next pass tries again; it never holds the pass, or the table's
+other users, for longer.
+
+The declared file is YAML, pinned by the SHA-256 the process is started with
+(--sha256, in the pod spec: the file and its mount cannot name their own pin).
+A file that does not match the pin is not applied. Unknown keys, repeated keys
+and undeclared references are refused.
+
+    roles:                      # name -> attributes, all optional
+      cloud:
+        oauth: true             # member of sql_iam (default false)
+        createdb: false         # CREATEDB (default false)
+        createrole: false       # CREATEROLE (default false)
+        enroll: false           # WITH ADMIN OPTION on sql_iam; needs oauth
+        connect: [cloud]        # databases it may connect to besides its own
+    databases:                  # name -> owner, and what to adopt
+      git:
+        owner: git              # a declared role, or the superuser
+        adopt: hanzo            # objects this role owns here become git's
+    dcs:                        # Patroni's dynamic config, whole; omit to leave it
+      ttl: 30
+      postgresql:
+        pg_hba: ["local all all trust"]
+
+pg_hba is part of the DCS block, so Patroni writes it to every member. On the
+leader the reconciler waits until pg_hba.conf holds the declared lines, reloads,
+and checks that the server accepted every line.
+
+A declared database is fenced: PUBLIC cannot connect, and a declared role
+connects only as its owner or through a `connect` list. An undeclared database is
+untouched, and so is a grant to a role the file does not declare.
+
+A role is declared to be LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS with the
+two flags above, and each pass converges a declared role to that, so a role that
+needs anything else (REPLICATION, BYPASSRLS, a membership such as
+pg_read_all_data) is not declared. The file refuses the superuser, the Patroni
+replication user, sql_iam and pg_*, so a declaration cannot strip the
+replication user of REPLICATION.
+
+pg_hba is kept in the DCS and Patroni writes it to every member; a
+`postgresql.pg_hba` in a member's own Patroni file shadows it, and the pass then
+reports that pg_hba.conf never holds the declared lines. The hash of the lines
+last reloaded is the comment on the role sql_iam.
+
+The superuser is SQL_USER and the replication user SQL_REPLICATION_USER, as
+sqlha reads them; the Patroni REST credential is PATRONI_RESTAPI_USERNAME and
+PATRONI_RESTAPI_PASSWORD, as Patroni reads them. Exit status of --once: 0 when
+the pass found nothing wrong, 1 otherwise.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import signal
+import sys
+import time
+import urllib.request
+
+import psycopg2
+import yaml
+from psycopg2 import sql
+
+quote = sql.Identifier
+GROUP = "sql_iam"
+RESERVED = ("postgres", "template0", "template1")
+SETTLE = 30  # seconds for Patroni to show a new config and write the declared pg_hba lines
+LOCK_TIMEOUT = 5000  # ms a statement waits for a lock; ALTER OWNER queues every user of the table behind it
+STATEMENT_TIMEOUT = 60000  # ms a statement may run
+
+# Every kind of object a role may own in a database, as (catalog, owner column,
+# ALTER keyword, extra condition, identify class, moves). The listing reads the
+# catalogs because pg_shdepend records nothing for the bootstrap superuser, the
+# role whose objects are adopted. Objects below oid 16384 came with initdb; a
+# member of an extension stays with it; a sequence owned by a column and an index
+# follow their table. `moves` is false for the kinds only a superuser may own:
+# the adoption lists them and reports them, and does not try.
+OWNED = (
+    ("pg_namespace", "nspowner", "'SCHEMA'", "TRUE", None, True),
+    ("pg_class", "relowner",
+     "CASE t.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW'"
+     " WHEN 'S' THEN 'SEQUENCE' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END",
+     "t.relkind IN ('r', 'p', 'v', 'm', 'S', 'f') AND NOT (t.relkind = 'S' AND EXISTS ("
+     "SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = t.oid"
+     " AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')))", None, True),
+    ("pg_proc", "proowner",
+     "CASE t.prokind WHEN 'p' THEN 'PROCEDURE' WHEN 'a' THEN 'AGGREGATE' ELSE 'FUNCTION' END", "TRUE", None, True),
+    ("pg_type", "typowner", "CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END",
+     "t.typcategory <> 'A' AND (t.typtype IN ('b', 'd', 'e', 'r') OR (t.typtype = 'c' AND EXISTS ("
+     "SELECT 1 FROM pg_class k WHERE k.oid = t.typrelid AND k.relkind = 'c')))", None, True),
+    ("pg_collation", "collowner", "'COLLATION'", "TRUE", None, True),
+    ("pg_conversion", "conowner", "'CONVERSION'", "TRUE", None, True),
+    ("pg_operator", "oprowner", "'OPERATOR'", "TRUE", None, True),
+    ("pg_opfamily", "opfowner", "'OPERATOR FAMILY'", "TRUE", None, True),
+    ("pg_opclass", "opcowner", "'OPERATOR CLASS'", "TRUE", None, True),
+    ("pg_ts_dict", "dictowner", "'TEXT SEARCH DICTIONARY'", "TRUE", None, True),
+    ("pg_ts_config", "cfgowner", "'TEXT SEARCH CONFIGURATION'", "TRUE", None, True),
+    ("pg_statistic_ext", "stxowner", "'STATISTICS'", "TRUE", None, True),
+    ("pg_publication", "pubowner", "'PUBLICATION'", "TRUE", None, True),
+    ("pg_foreign_server", "srvowner", "'SERVER'", "TRUE", None, True),
+    ("pg_language", "lanowner", "'LANGUAGE'", "TRUE", None, True),
+    ("pg_largeobject_metadata", "lomowner", "'LARGE OBJECT'", "TRUE", "pg_largeobject", True),
+    ("pg_foreign_data_wrapper", "fdwowner", "'FOREIGN DATA WRAPPER'", "TRUE", None, False),
+    ("pg_event_trigger", "evtowner", "'EVENT TRIGGER'", "TRUE", None, False),
+    ("pg_subscription", "subowner", "'SUBSCRIPTION'",
+     "t.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())", None, False),
+)
+
+
+def listing(moves):
+    """The query for the objects a role owns in this database: those that move, or all of them."""
+    return (
+        "WITH o AS (SELECT oid FROM pg_roles WHERE rolname = %s), c AS ("
+        + " UNION ALL ".join(
+            "SELECT '{cls}'::regclass AS cls, t.oid, {kw} AS kw FROM {cat} t, o WHERE t.{col} = o.oid AND {cond}".format(
+                cls=cls or cat, cat=cat, col=col, kw=kw, cond=cond)
+            for cat, col, kw, cond, cls, move in OWNED if move or not moves)
+        + ") SELECT c.kw, (pg_identify_object(c.cls, c.oid, 0)).identity FROM c WHERE c.oid >= 16384"
+        " AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = c.cls AND d.objid = c.oid AND d.deptype = 'e')"
+        " ORDER BY c.cls, c.oid")
+
+
+class Invalid(Exception):
+    """The declared file cannot be applied."""
+
+
+def first(err):
+    """The first line of a server error."""
+    lines = str(err).strip().splitlines()
+    return lines[0] if lines else err.__class__.__name__
+
+
+def log(message):
+    print("%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), message), flush=True)
+
+
+class Loader(yaml.SafeLoader):
+    """SafeLoader that refuses a key repeated in one mapping."""
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key, _ in node.value:
+            name = self.construct_object(key, deep=True)
+            if name in seen:
+                raise Invalid("key %r is declared twice" % (name,))
+            seen.add(name)
+        return super().construct_mapping(node, deep)
+
+
+def label(kind, value):
+    if not isinstance(value, str) or not 0 < len(value.encode()) <= 63 or "\0" in value:
+        raise Invalid("%s name %r must be 1 to 63 bytes of text without NUL" % (kind, value))
+    return value
+
+
+def mapping(where, value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise Invalid("%s must be a mapping" % where)
+    return value
+
+
+def flag(where, attrs, key):
+    value = attrs.get(key, False)
+    if not isinstance(value, bool):
+        raise Invalid("%s: %s must be true or false" % (where, key))
+    return value
+
+
+def keys(where, value, allowed):
+    unknown = sorted(str(k) for k in mapping(where, value) if k not in allowed)
+    if unknown:
+        raise Invalid("%s: unknown key %s" % (where, ", ".join(unknown)))
+
+
+def concrete(where, value):
+    """The DCS block holds values only: a null would delete a key, not declare one."""
+    if value is None:
+        raise Invalid("%s: null is not a value" % where)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            concrete("%s.%s" % (where, key), item)
+
+
+def validate(doc, user, replication):
+    """The declared file as roles, databases and the DCS block, or Invalid."""
+    keys("declared file", doc, ("roles", "databases", "dcs"))
+    doc = doc or {}
+    roles = {}
+    for role, attrs in mapping("roles", doc.get("roles")).items():
+        label("role", role)
+        if role in (user, replication, GROUP) or role.startswith("pg_"):
+            raise Invalid("role %s is reserved (the superuser, the replication user, %s and pg_* are never declared)"
+                          % (role, GROUP))
+        keys("role %s" % role, attrs, ("oauth", "createdb", "createrole", "enroll", "connect"))
+        attrs = attrs or {}
+        roles[role] = {key: flag("role %s" % role, attrs, key) for key in ("oauth", "createdb", "createrole", "enroll")}
+        if roles[role]["enroll"] and not roles[role]["oauth"]:
+            raise Invalid("role %s: enroll needs oauth" % role)
+        connect = attrs.get("connect", [])
+        if not isinstance(connect, list):
+            raise Invalid("role %s: connect must be a list" % role)
+        roles[role]["connect"] = [label("database", database) for database in connect]
+    databases = {}
+    for database, attrs in mapping("databases", doc.get("databases")).items():
+        label("database", database)
+        if database in RESERVED:
+            raise Invalid("database %s is reserved" % database)
+        keys("database %s" % database, attrs, ("owner", "adopt"))
+        owner = label("owner", (attrs or {}).get("owner"))
+        if owner != user and owner not in roles:
+            raise Invalid("database %s: owner %s is not a declared role" % (database, owner))
+        adopt = attrs.get("adopt")
+        if adopt is not None and label("adopt", adopt) == owner:
+            raise Invalid("database %s: adopt names its owner" % database)
+        databases[database] = {"owner": owner, "adopt": adopt}
+    for role, attrs in roles.items():
+        for database in attrs["connect"]:
+            if database not in databases:
+                raise Invalid("role %s: connect names undeclared database %s" % (role, database))
+    dcs = doc.get("dcs")
+    if dcs is not None:
+        concrete("dcs", mapping("dcs", dcs))
+        hba = mapping("dcs.postgresql", dcs.get("postgresql")).get("pg_hba")
+        if hba is not None and not (isinstance(hba, list) and all(isinstance(line, str) for line in hba)):
+            raise Invalid("dcs.postgresql.pg_hba must be a list of lines")
+    return {"roles": roles, "databases": databases, "dcs": dcs}
+
+
+def load(path, pin, user, replication):
+    """The declared file at path, once its bytes equal the SHA-256 pin."""
+    try:
+        with open(path, "rb") as file:
+            raw = file.read()
+    except OSError as err:
+        raise Invalid("cannot read the declared file: %s" % err)
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != pin:
+        raise Invalid("declared file sha256 %s does not match its pin %s" % (digest, pin))
+    try:
+        return validate(yaml.load(raw, Loader), user, replication), digest
+    except yaml.YAMLError as err:
+        raise Invalid("declared file is not YAML: %s" % err)
+
+
+def diff(have, want):
+    """The merge patch that turns have into want: a null deletes a key."""
+    patch = {}
+    for key, value in want.items():
+        if isinstance(value, dict) and isinstance(have.get(key), dict):
+            inner = diff(have[key], value)
+            if inner:
+                patch[key] = inner
+        elif key not in have or have[key] != value:
+            patch[key] = value
+    for key in have:
+        if key not in want:
+            patch[key] = None
+    return patch
+
+
+def rules(lines):
+    return [" ".join(line.split()) for line in lines if line.strip() and not line.lstrip().startswith("#")]
+
+
+class Pass:
+    """One pass against one server: what it wrote and what it found wrong."""
+
+    def __init__(self, args, user):
+        self.args = args
+        self.user = user
+        self.writes = 0
+        self.problems = 0
+        self.conns = {}
+
+    def conn(self, database):
+        if database not in self.conns:
+            conn = psycopg2.connect(host=self.args.socket, port=self.args.port, user=self.user,
+                                    dbname=database, application_name="reconcile", connect_timeout=5,
+                                    options="-c lock_timeout=%d -c statement_timeout=%d" % (LOCK_TIMEOUT, STATEMENT_TIMEOUT))
+            conn.autocommit = True
+            self.conns[database] = conn
+        return self.conns[database]
+
+    def sql(self, database, query, args=None, write=False):
+        """Log a statement, send it, and return its rows."""
+        with self.conn(database).cursor() as cur:
+            text = " ".join(cur.mogrify(query, args).decode().split())
+            log("sql %s %s: %s" % ("write" if write else "read", database, text))
+            cur.execute(query, args)
+            if write:
+                self.writes += 1
+            return cur.fetchall() if cur.description else []
+
+    def attempt(self, what, step, *args):
+        """Run one step; a server error is reported and the pass goes on."""
+        try:
+            return step(*args)
+        except psycopg2.Error as err:
+            self.problem("%s: %s" % (what, first(err)))
+
+    def problem(self, message):
+        self.problems += 1
+        log("ERROR " + message)
+
+    def leader(self):
+        return not self.sql("postgres", "SELECT pg_is_in_recovery()")[0][0]
+
+    def roles(self, roles):
+        db = "postgres"
+        have = {row[0]: row for row in self.sql(
+            db, "SELECT rolname, rolcanlogin, rolsuper, rolreplication, rolbypassrls, rolcreatedb, rolcreaterole,"
+                " coalesce(rolconfig, '{}') FROM pg_roles WHERE rolname = ANY(%s)", (list(roles) + [GROUP],))}
+        if GROUP not in have:
+            self.attempt("create " + GROUP, self.sql, db, sql.SQL(
+                "CREATE ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS").format(
+                quote(GROUP)), None, True)
+        for role, attrs in sorted(roles.items()):
+            row = have.get(role)
+            wanted = sql.SQL("LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS {} {}").format(
+                sql.SQL("CREATEDB" if attrs["createdb"] else "NOCREATEDB"),
+                sql.SQL("CREATEROLE" if attrs["createrole"] else "NOCREATEROLE"))
+            if row is None:
+                self.attempt("create role " + role, self.sql, db,
+                             sql.SQL("CREATE ROLE {} {}").format(quote(role), wanted), None, True)
+            elif row[1:7] != (True, False, False, False, attrs["createdb"], attrs["createrole"]):
+                self.attempt("alter role " + role, self.sql, db,
+                             sql.SQL("ALTER ROLE {} {}").format(quote(role), wanted), None, True)
+            if row is None or "synchronous_commit=on" not in row[7]:
+                self.attempt("alter role " + role, self.sql, db,
+                             sql.SQL("ALTER ROLE {} SET synchronous_commit = on").format(quote(role)), None, True)
+        members = {row[0]: row[1] for row in self.sql(
+            db, "SELECT m.rolname, bool_or(a.admin_option) FROM pg_auth_members a"
+                " JOIN pg_roles g ON g.oid = a.roleid JOIN pg_roles m ON m.oid = a.member"
+                " WHERE g.rolname = %s GROUP BY m.rolname", (GROUP,))}
+        for role, attrs in sorted(roles.items()):
+            group, member = quote(GROUP), quote(role)
+            if attrs["oauth"] and (role not in members or attrs["enroll"] and not members[role]):
+                self.attempt("enroll " + role, self.sql, db, sql.SQL("GRANT {} TO {}{}").format(
+                    group, member, sql.SQL(" WITH ADMIN OPTION" if attrs["enroll"] else "")), None, True)
+            elif attrs["oauth"] and members[role] and not attrs["enroll"]:
+                self.attempt("enroll " + role, self.sql, db,
+                             sql.SQL("REVOKE ADMIN OPTION FOR {} FROM {}").format(group, member), None, True)
+            elif not attrs["oauth"] and role in members:
+                self.attempt("expel " + role, self.sql, db, sql.SQL("REVOKE {} FROM {}").format(group, member), None, True)
+
+    def databases(self, roles, databases):
+        db = "postgres"
+        for database, attrs in sorted(databases.items()):
+            owner = attrs["owner"]
+            row = self.sql(db, "SELECT o.rolname FROM pg_database d JOIN pg_roles o ON o.oid = d.datdba"
+                               " WHERE d.datname = %s", (database,))
+            if not row:
+                self.attempt("create database " + database, self.sql, db,
+                             sql.SQL("CREATE DATABASE {} OWNER {}").format(quote(database), quote(owner)), None, True)
+            elif row[0][0] != owner:
+                self.attempt("alter database " + database, self.sql, db,
+                             sql.SQL("ALTER DATABASE {} OWNER TO {}").format(quote(database), quote(owner)), None, True)
+            if attrs["adopt"]:
+                self.attempt("adopt " + database, self.adopt, database, owner, attrs["adopt"])
+            self.attempt("fence " + database, self.fence, database, owner, set(roles),
+                         {role for role, a in roles.items() if database in a["connect"]})
+
+    def adopt(self, database, owner, previous):
+        """ALTER OWNER on each object previous owns in database; nothing else changes hands.
+
+        What previous still owns afterwards is reported: an adoption that leaves objects behind is not done."""
+        if not self.sql(database, "SELECT 1 FROM pg_roles WHERE rolname = %s", (previous,)):
+            return self.problem("adopt %s: role %s does not exist" % (database, previous))
+        failed = set()
+        for keyword, identity in self.sql(database, listing(True), (previous,)):
+            if self.attempt("adopt %s %s" % (keyword.lower(), identity), self.sql, database, sql.SQL(
+                    "ALTER {} {} OWNER TO {}").format(sql.SQL(keyword), sql.SQL(identity), sql.Identifier(owner)),
+                    None, True) is None:
+                failed.add(identity)
+        for keyword, identity in self.sql(database, listing(False), (previous,)):
+            if identity not in failed:
+                self.problem("adopt %s %s: still owned by %s" % (keyword.lower(), identity, previous))
+
+    def fence(self, database, owner, declared, connect):
+        """CONNECT for the owner and the roles that list the database; no other declared role, and not PUBLIC.
+
+        A grant to a role the file does not declare is not the file's to take back."""
+        db = "postgres"
+        have = {row[0] for row in self.sql(
+            db, "SELECT coalesce(g.rolname, 'PUBLIC') FROM pg_database d,"
+                " aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a"
+                " LEFT JOIN pg_roles g ON g.oid = a.grantee"
+                " WHERE d.datname = %s AND a.privilege_type = 'CONNECT'", (database,))}
+        if "PUBLIC" in have:
+            self.sql(db, sql.SQL("REVOKE CONNECT ON DATABASE {} FROM PUBLIC").format(quote(database)), None, True)
+        for role in sorted(connect - have):
+            self.sql(db, sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(quote(database), quote(role)), None, True)
+        for role in sorted((have & declared) - connect - {owner}):
+            self.sql(db, sql.SQL("REVOKE CONNECT ON DATABASE {} FROM {}").format(quote(database), quote(role)), None, True)
+
+    def passwords(self):
+        """Report every member of sql_iam that has a password: a role may set its own."""
+        for (role,) in self.sql("postgres", "SELECT m.rolname FROM pg_auth_members a"
+                                " JOIN pg_roles g ON g.oid = a.roleid JOIN pg_authid m ON m.oid = a.member"
+                                " WHERE g.rolname = %s AND m.rolpassword IS NOT NULL ORDER BY 1", (GROUP,)):
+            self.problem("%s member %s has a password (rolpassword is not NULL)" % (GROUP, role))
+
+    def patroni(self, method, path, body=None):
+        request = urllib.request.Request(
+            self.args.patroni + path, method=method,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        if os.environ.get("PATRONI_RESTAPI_USERNAME"):
+            token = "%s:%s" % (os.environ["PATRONI_RESTAPI_USERNAME"], os.environ.get("PATRONI_RESTAPI_PASSWORD", ""))
+            request.add_header("Authorization", "Basic " + base64.b64encode(token.encode()).decode())
+        log("patroni %s %s%s" % (method, path, "" if body is None else " " + json.dumps(body, sort_keys=True)))
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if method != "GET":
+                self.writes += 1
+            return json.load(response)
+
+    def dcs(self, want):
+        """PATCH /config until the DCS equals want; Patroni shows a change within a loop, so wait for it."""
+        try:
+            patch = diff(self.patroni("GET", "/config"), want)
+            if not patch:
+                return
+            self.patroni("PATCH", "/config", patch)
+            deadline = time.monotonic() + SETTLE
+            while diff(self.patroni("GET", "/config"), want):
+                if time.monotonic() > deadline:
+                    return self.problem("patroni /config does not equal the declared config after %ds" % SETTLE)
+                time.sleep(1)
+        except (OSError, ValueError) as err:
+            self.problem("patroni /config: %s" % err)
+
+    def hba(self, lines):
+        """Reload pg_hba once Patroni has written the declared lines, and check the server took them."""
+        wanted = rules(lines)
+        digest = hashlib.sha256("\n".join(wanted).encode()).hexdigest()
+        mark = "pg_hba sha256:" + digest
+        recorded = self.sql("postgres", "SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = %s",
+                            (GROUP,))
+        if recorded and recorded[0][0] == mark:
+            return
+        deadline = time.monotonic() + SETTLE
+        while rules(self.sql("postgres", "SELECT pg_read_file(current_setting('hba_file'))")[0][0].splitlines()) != wanted:
+            if time.monotonic() > deadline:
+                return self.problem("pg_hba.conf does not hold the declared lines after %ds" % SETTLE)
+            time.sleep(1)
+        self.sql("postgres", "SELECT pg_reload_conf()", None, True)
+        errors = self.sql("postgres", "SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL")
+        for number, error in errors:
+            self.problem("pg_hba.conf line %d: %s" % (number, error))
+        if not errors:
+            self.sql("postgres", sql.SQL("COMMENT ON ROLE {} IS {}").format(sql.Identifier(GROUP), sql.Literal(mark)),
+                     None, True)
+
+
+def reconcile(args, user, replication):
+    """One pass. True when it found nothing wrong."""
+    run = Pass(args, user)
+    try:
+        if not run.leader():
+            log("pass: standby, nothing to do")
+            return True
+        try:
+            declared, digest = load(args.declared, args.sha256, user, replication)
+        except Invalid as err:
+            log("ERROR declared file: %s" % err)
+            return False
+        log("pass: leader, declared sha256 %s" % digest)
+        run.attempt("roles", run.roles, declared["roles"])
+        run.attempt("databases", run.databases, declared["roles"], declared["databases"])
+        run.attempt("passwords", run.passwords)
+        dcs = declared["dcs"]
+        if dcs is not None:
+            run.dcs(dcs)
+            if dcs.get("postgresql", {}).get("pg_hba") is not None:
+                run.attempt("pg_hba", run.hba, dcs["postgresql"]["pg_hba"])
+    except psycopg2.Error as err:
+        log("ERROR postgres: %s" % first(err))
+        return False
+    finally:
+        for conn in run.conns.values():
+            conn.close()
+    log("pass: %d writes, %d problems" % (run.writes, run.problems))
+    return run.problems == 0
+
+
+def pin(text):
+    if len(text) != 64 or any(char not in "0123456789abcdefABCDEF" for char in text):
+        raise argparse.ArgumentTypeError("must be 64 hex digits")
+    return text.lower()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--declared", default="/etc/sql/declared/declared.yml", help="the declared file")
+    parser.add_argument("--sha256", required=True, type=pin, help="the SHA-256 the declared file must have (`sha256sum FILE`)")
+    parser.add_argument("--socket", default="/var/run/postgresql", help="the server's socket directory")
+    parser.add_argument("--port", type=int, default=5432)
+    parser.add_argument("--patroni", default="http://127.0.0.1:8008", help="this member's Patroni REST API")
+    parser.add_argument("--interval", type=int, default=60, help="seconds between passes")
+    parser.add_argument("--once", action="store_true", help="run one pass and exit")
+    args = parser.parse_args()
+    user = os.environ.get("SQL_USER")
+    replication = os.environ.get("SQL_REPLICATION_USER")
+    if not user or not replication:
+        sys.exit("reconcile: SQL_USER and SQL_REPLICATION_USER are required")
+    if args.once:
+        sys.exit(0 if reconcile(args, user, replication) else 1)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    while True:
+        reconcile(args, user, replication)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()

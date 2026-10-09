@@ -158,6 +158,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY sqlha.sh /usr/local/bin/sqlha
 
+# reconcile is the sidecar of a sql pod: on the leader it makes roles, databases,
+# the DCS block and pg_hba equal the declared file the pod mounts. It runs in the
+# patroni venv, which sees psycopg2 and carries PyYAML; --help imports both, so a
+# build whose python lacks either fails here and not in a pod.
+COPY bin/reconcile /usr/local/bin/reconcile
+RUN /usr/local/bin/reconcile --help >/dev/null
+
 # `sqld` is the daemon, matching luxd / hanzod / zood / kvd — the fleet names a
 # long-running server <thing>d. A SYMLINK rather than a rename: the server
 # re-execs itself by path and the extensions resolve against the upstream name,

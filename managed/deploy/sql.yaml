@@ -3,9 +3,9 @@
 # Declarative provisioning via the existing `SQL` datastore Kind (operator
 # facade over DatastoreSpec — same StatefulSet + ClusterIP Service + headless
 # `<name>-hs` + per-replica PVC machinery that backs `docdb`). This reuse is the
-# one-way: no new CRD. The only change from the legacy Postgres `crs/sql.yaml`
-# is the image — swap `ghcr.io/hanzoai/sql:18` (the shared Postgres we are
-# retiring) for the embedded-Postgres pg-wire endpoint.
+# one-way: no new CRD. The only change from the hanzo-sql `crs/sql.yaml` is the
+# image — swap `ghcr.io/hanzoai/sql:18` (hanzo-sql, the one shared PostgreSQL,
+# which stays and is not this product) for the embedded-Postgres pg-wire endpoint.
 #
 # A tenant that needs an isolated `postgres://` = one such CR (or a
 # `ManagedDatabase` CR, the paid isolated-tenant facade). Consumer DNS =

@@ -1,10 +1,11 @@
 # Hanzo SQL (managed)
 
-Per-tenant, SQLite-backed, provisioned-on-demand SQL — the replacement for the
-shared multi-tenant Postgres (`ghcr.io/hanzoai/sql:18`) we are retiring. Exactly
-analogous to **docdb** (FerretDB-on-SQLite → Mongo-wire per tenant): docdb is the
-document product, Hanzo SQL is the relational one. The tenant boundary is a
-**file**, not a schema/row filter.
+Per-tenant, SQLite-backed, provisioned-on-demand SQL. It sits beside hanzo-sql,
+the one shared PostgreSQL 18 server (`ghcr.io/hanzoai/sql`, under Patroni), which
+stays; this directory is the per-tenant product only. Exactly analogous to
+**docdb** (FerretDB-on-SQLite → Mongo-wire per tenant): docdb is the document
+product, Hanzo SQL is the relational one. The tenant boundary is a **file**, not
+a schema/row filter.
 
 This directory is the product spec + the pieces that were missing. The core
 provisioning machinery **already exists in the operator** — this is not a
@@ -115,8 +116,8 @@ data dir, prints the DATABASE_URL).
   `hanzo-build-linux-amd64` via `hanzoai/.github` `docker-build.yml` (linux/amd64).
   Base `ghcr.io/hanzoai/nodejs:v24.18.0`. See `pgwire/Dockerfile`.
 - Path C reuses each consuming app's own image + the `hanzoai/replicate` sidecar.
-- The legacy `ghcr.io/hanzoai/sql:18` (Postgres source fork) is the thing being
-  retired; do not build new tags of it.
+- `ghcr.io/hanzoai/sql` is hanzo-sql, the shared server, not this product. It
+  keeps its own tags and is configured by `bin/reconcile` (see the root `LLM.md`).
 
 ## Data migration (the real blocker) — Postgres → SQLite ETL
 
