@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq-dev \
         libicu-dev \
         libkrb5-dev \
+        libssl-dev \
         # PostGIS (runtime dep for documentdb CREATE EXTENSION)
         postgresql-${PG_MAJOR}-postgis-3 \
     && rm -rf /var/lib/apt/lists/*
@@ -84,6 +85,13 @@ RUN cd /tmp/zap_fdw && \
     make USE_PGXS=1 PG_CONFIG=/usr/bin/pg_config install && \
     cd / && rm -rf /tmp/zap_fdw
 
+# --- hanzo_iam (OAuth validator for hanzo-sql tokens: oauth_validator_libraries) ---
+COPY contrib/hanzo_iam /tmp/hanzo_iam
+RUN cd /tmp/hanzo_iam && \
+    make PG_CONFIG=/usr/bin/pg_config && \
+    make PG_CONFIG=/usr/bin/pg_config install && \
+    cd / && rm -rf /tmp/hanzo_iam
+
 # --- pg_documentdb (core + api + extended_rum) ---
 ARG DOCUMENTDB_VERSION=main
 RUN cd /tmp && \
@@ -135,6 +143,10 @@ COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/documentdb_exten
 # Copy zap_fdw extension (disabled by default — set zap.enabled=true to activate)
 COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/zap_fdw.so /usr/lib/postgresql/${PG_MAJOR}/lib/
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/zap_fdw* /usr/share/postgresql/${PG_MAJOR}/extension/
+
+# Copy hanzo_iam, the OAuth validator (oauth_validator_libraries = 'hanzo_iam';
+# trusts the <kid>.pem files in hanzo_iam.dir)
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/hanzo_iam.so /usr/lib/postgresql/${PG_MAJOR}/lib/
 
 # Custom postgresql.conf tuned for AI workloads
 COPY conf/postgresql.conf /etc/postgresql/postgresql.conf

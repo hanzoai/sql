@@ -61,3 +61,35 @@ Tests: `python3 bin/test_reconcile.py` starts a leader and a standby under Patro
 `/usr/lib/postgresql/*/bin`; `patroni[raft]`, psycopg2 and PyYAML importable). It
 is run by hand, against the image's PostgreSQL major (18): CI has no server and the
 image has no raft extra. Last run on PostgreSQL 16.15 and 18.6.
+
+## contrib/hanzo_iam
+
+OAuth validator for hanzo-sql (`oauth_validator_libraries = 'hanzo_iam'`), built with PGXS
+against PostgreSQL 18 (the server the image ships), not by the top-level build. The pg_hba.conf
+line is `oauth issuer="https://hanzo.id" scope="hanzo-sql" validator=hanzo_iam
+delegate_ident_mapping=1`.
+
+- **Trust**: the public keys `<kid>.pem` in GUC `hanzo_iam.dir` (SIGHUP), read on every
+  connection, so removing a file revokes its key at once. Rotation adds a file, runs both, removes
+  the old one. No HTTP to IAM.
+- **Token**: compact JWS, RS256 (OpenSSL EVP, RSA key of at least 2048 bits, at most 16 KiB of
+  PEM). At most 8192 bytes whole, three parts; each part decodes into a buffer capped at 6 KiB, so
+  the size check is not the only bound. `iss` is `https://hanzo.id`, `aud` holds `hanzo-sql`, `typ`
+  is `sql`, no `act`, `sub` is `sql:<role>`, `exp` and `iat` required, `exp` at most 60 s past,
+  `iat` at most 60 s ahead, `nbf` optional and, when present, at most 60 s ahead, `exp - iat` in
+  (0, 600] s. `typ` is a claim: the JOSE header's own `typ` is not read, so a minter puts `typ`
+  in the claims (a header of `JWT` is fine). The claims are not parsed until the signature
+  verifies. JSON goes through PG's jsonapi, escapes decoded; a member a check names may appear
+  once, however it is spelled.
+- **Authorization**: `authn_id` is the role in `sub`; the connection is authorized only when it
+  equals the role requested. Why a token was refused is one `hanzo_iam: <reason>` log line from a
+  fixed list (a role mismatch logs `role mismatch` and neither role), never sent to the client. A
+  key file that cannot be opened or is no PEM public key is also named by its path, for the
+  operator.
+- **Files**: `token.c` is pure (server module and fuzz target both compile it), `hanzo_iam.c` is
+  the module. Tests: `make installcheck` runs `t/001_hanzo_iam.pl` against an installed server;
+  `make fuzz` builds `fuzz/fuzz` (libFuzzer, ASan, UBSan; seeds in `fuzz/corpus`), run with
+  `-max_len=9500` so inputs reach past the 8 KiB bound.
+- **CI**: nothing runs the TAP test or the fuzz target. `hanzo.yml` declares no `test:` lane and
+  the Dockerfile only compiles the module, so run both by hand (PostgreSQL 18, `make installcheck`;
+  `make fuzz`, 10 minutes clean) before changing `token.c` or `hanzo_iam.c`.
