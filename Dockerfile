@@ -1,7 +1,8 @@
-ARG PG_MAJOR=18
+ARG PG_MAJOR=19
+ARG PG_VERSION=19.0
 
 # Stage 1: Build all extensions on Debian (documentdb requires glibc toolchain)
-FROM postgres:${PG_MAJOR}-bookworm AS builder
+FROM postgres:${PG_VERSION}-bookworm AS builder
 ARG PG_MAJOR
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -24,18 +25,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # --- pgvector ---
+ARG PGVECTOR_VERSION=v0.8.7
 RUN cd /tmp && \
-    curl -sL https://github.com/hanzoai/sql-vector/archive/refs/heads/master.tar.gz | tar xz && \
-    cd sql-vector-master && \
+    curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/${PGVECTOR_VERSION}.tar.gz | tar xz && \
+    cd pgvector-* && \
     make clean && \
     make OPTFLAGS="" PG_CONFIG=/usr/bin/pg_config && \
     make install PG_CONFIG=/usr/bin/pg_config && \
-    cd / && rm -rf /tmp/sql-vector-master
+    cd / && rm -rf /tmp/pgvector-*
 
 # --- pg_cron ---
-ARG PG_CRON_VERSION=v1.6.7
+ARG PG_CRON_VERSION=v1.6.8
 RUN cd /tmp && \
-    curl -sL https://github.com/citusdata/pg_cron/archive/refs/tags/${PG_CRON_VERSION}.tar.gz | tar xz && \
+    curl -fsSL https://github.com/citusdata/pg_cron/archive/refs/tags/${PG_CRON_VERSION}.tar.gz | tar xz && \
     cd pg_cron-* && \
     make PG_CONFIG=/usr/bin/pg_config && \
     make install PG_CONFIG=/usr/bin/pg_config && \
@@ -93,9 +95,9 @@ RUN cd /tmp/hanzo_iam && \
     cd / && rm -rf /tmp/hanzo_iam
 
 # --- pg_documentdb (core + api + extended_rum) ---
-ARG DOCUMENTDB_VERSION=main
+ARG DOCUMENTDB_VERSION=v1.2-0
 RUN cd /tmp && \
-    curl -sL https://github.com/microsoft/documentdb/archive/refs/heads/${DOCUMENTDB_VERSION}.tar.gz | tar xz && \
+    curl -fsSL https://github.com/documentdb/documentdb/archive/refs/tags/${DOCUMENTDB_VERSION}.tar.gz | tar xz && \
     cd documentdb-* && \
     make -C pg_documentdb_core PG_CONFIG=/usr/bin/pg_config install && \
     make -C pg_documentdb PG_CONFIG=/usr/bin/pg_config install && \
@@ -103,14 +105,14 @@ RUN cd /tmp && \
     cd / && rm -rf /tmp/documentdb-*
 
 # Stage 2: Runtime image (Debian for glibc compat with documentdb)
-FROM postgres:${PG_MAJOR}-bookworm
+FROM postgres:${PG_VERSION}-bookworm
 
 LABEL maintainer="dev@hanzo.ai"
 LABEL org.opencontainers.image.source="https://github.com/hanzoai/sql"
-LABEL org.opencontainers.image.description="Hanzo SQL - PostgreSQL with pgvector, pg_cron, and pg_documentdb"
+LABEL org.opencontainers.image.description="Hanzo SQL - PostgreSQL 19 with pgvector, pg_cron, and pg_documentdb"
 
 # Runtime deps: libpq (pg_cron), PostGIS (documentdb geospatial), ICU
-ARG PG_MAJOR=18
+ARG PG_MAJOR=19
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
         postgresql-${PG_MAJOR}-postgis-3 \

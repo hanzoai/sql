@@ -1,4 +1,4 @@
-# ghcr.io/hanzoai/sql — PostgreSQL 18 with pgvector, pg_cron, pg_documentdb and
+# ghcr.io/hanzoai/sql — PostgreSQL 19 with pgvector, pg_cron, pg_documentdb and
 # this repo's own contrib/zap_fdw and contrib/hanzo_iam. The Dockerfile IS the
 # gate: it compiles zap_fdw and hanzo_iam from this tree and bakes conf/ and
 # docker-entrypoint-initdb.d/, so a break in any of them fails the build. That
@@ -10,13 +10,13 @@
 # manifest, and this tree has none it recognises — no package.json, Cargo.toml,
 # VERSION or pyproject.toml — so the first run died with "no version for
 # ghcr.io/hanzoai/sql. We don't ship shas." It tracks PG_MAJOR, which is what
-# the image actually ships: the runtime stage is FROM postgres:18-bookworm.
+# the image actually ships: the runtime stage is FROM postgres:19.0-bookworm.
 # NOT configure.ac's 19beta1 — that is the vendored PostgreSQL source fork,
 # which this image does not build and does not run. imgver takes
 # max(declared, published) + a patch, so the series moves on its own from here.
 #
 # No deploy:. universe pins the live tag.
-version: 18.0.0
+version: 19.0.0
 images:
   - name: sql
     context: .

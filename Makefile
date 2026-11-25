@@ -2,7 +2,7 @@
 
 IMAGE := ghcr.io/hanzoai/sql
 TAG := latest
-PG_MAJOR := 18
+PG_MAJOR := 19
 
 build:
 	docker build --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE):$(TAG) .
@@ -12,9 +12,9 @@ push: build
 
 run:
 	docker run -d --name hanzo-sql \
-		-e POSTGRES_PASSWORD=hanzo \
-		-e POSTGRES_DB=hanzo \
-		-e POSTGRES_USER=hanzo \
+		-e SQL_PASSWORD=hanzo \
+		-e SQL_DB=hanzo \
+		-e SQL_USER=hanzo \
 		-p 5432:5432 \
 		$(IMAGE):$(TAG)
 
