@@ -3,8 +3,8 @@
 # OAuth validator for hanzo-sql: accepts a hanzo-sql token, signed RS256 by a
 # key listed in hanzo_iam.dir.
 #
-# Built with PGXS against the installed server, PostgreSQL 18, which is the one
-# hanzo-sql runs (Dockerfile). This tree is a later PostgreSQL, so the top-level
+# Built with PGXS against the installed server, PostgreSQL 19, which is the one
+# hanzo-sql runs (Dockerfile). This tree is a vendored PostgreSQL fork, so the top-level
 # build does not descend into this directory.
 #
 #   make && make install                  the module, hanzo_iam.so
